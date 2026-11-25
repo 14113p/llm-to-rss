@@ -1,0 +1,21 @@
+title: "Flight Price Tracker (WAW -> TYO)"
+description: "Daily check on round-trip flight deals from Warsaw to Tokyo."
+category: "Travel & Deals"
+enabled: true
+schedule: "30 7 * * *"
+provider: "gemini_search"
+web_search: true
+deduplicate: true
+max_items: 30
+
+prompt: |
+  Today is {{date}}. Search the web for current round-trip economy flight prices
+  from Warsaw (WAW) to Tokyo (HND or NRT) for a 10-14 day trip in the next 3 months.
+
+  Summarize in a Markdown table:
+  - Airline / Alliance
+  - Approximate round-trip price (PLN or EUR)
+  - Number of stops & approximate travel dates
+  - Booking source / link
+
+  Highlight whether prices look notably low compared to typical ~3,200-4,000 PLN fares.

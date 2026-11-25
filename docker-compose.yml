@@ -1,0 +1,37 @@
+services:
+  llm-to-rss:
+    build: .
+    container_name: llm-to-rss
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - LLM_TO_RSS_BASE_URL=http://llm-to-rss:8080
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./feeds:/config/feeds:ro
+      - llm_to_rss_data:/config/data
+    ports:
+      - "8080:8080"
+
+  # Optional local FreshRSS instance (enable with: docker compose --profile freshrss up -d)
+  freshrss:
+    image: freshrss/freshrss:latest
+    container_name: freshrss
+    profiles: ["freshrss"]
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Europe/Warsaw}
+      - CRON_MIN=*/15
+    volumes:
+      - freshrss_data:/var/www/FreshRSS/data
+      - freshrss_extensions:/var/www/FreshRSS/extensions
+    ports:
+      - "8081:80"
+    depends_on:
+      - llm-to-rss
+
+volumes:
+  llm_to_rss_data:
+  freshrss_data:
+  freshrss_extensions:

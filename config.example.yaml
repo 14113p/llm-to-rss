@@ -1,0 +1,47 @@
+server:
+  bind: "0.0.0.0:8080"
+  # Public or internal URL clients/RSS readers use to reach this service (e.g. http://llm-to-rss:8080 in Docker)
+  base_url: "${LLM_TO_RSS_BASE_URL:-http://localhost:8080}"
+  # Optional bearer token for POST /feeds/{id}/run manual triggers
+  # trigger_token: "${LLM_TO_RSS_TRIGGER_TOKEN}"
+
+storage:
+  db_path: "data/llm-to-rss.db"
+
+defaults:
+  timezone: "${TZ:-Europe/Berlin}"
+  max_items: 50
+  timeout_secs: 90
+
+# Drop one *.yaml file per virtual feed into this directory
+feeds_dir: "feeds"
+
+providers:
+  # OpenAI Responses API with native web search enabled
+  openai_search:
+    kind: openai_responses
+    model: "gpt-4o"
+    api_key: "${OPENAI_API_KEY}"
+    web_search: true
+
+  # Google Gemini API with Google Search grounding enabled
+  gemini_search:
+    kind: gemini
+    model: "gemini-2.5-flash"
+    api_key: "${GEMINI_API_KEY}"
+    web_search: true
+
+  # Anthropic Messages API with web search tool
+  anthropic_search:
+    kind: anthropic
+    model: "claude-sonnet-4-20250514"
+    api_key: "${ANTHROPIC_API_KEY}"
+    web_search: true
+
+  # Any OpenAI-compatible API (OpenRouter, Perplexity, Ollama, LiteLLM, etc.)
+  # Example: local Ollama without an API key
+  ollama_local:
+    kind: openai_compatible
+    base_url: "http://localhost:11434/v1"
+    model: "llama3.2"
+    web_search: false

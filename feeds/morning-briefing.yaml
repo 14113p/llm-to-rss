@@ -1,0 +1,33 @@
+title: "Morning Tech & World Briefing"
+description: "Daily morning digest combining live RSS headlines with web context."
+category: "Daily Briefings"
+enabled: true
+schedule: "0 7 * * *"
+provider: "openai_search"
+# Optional per-feed overrides:
+# model: "gpt-4o-mini"
+# web_search: true
+deduplicate: false
+max_items: 30
+
+sources:
+  - type: rss
+    name: "Hacker News Frontpage"
+    url: "https://hnrss.org/frontpage"
+    limit: 12
+  - type: rss
+    name: "Lobsters"
+    url: "https://lobste.rs/rss"
+    limit: 10
+
+prompt: |
+  Prepare my morning briefing for {{date}}.
+
+  1. Group the most important stories from the pre-fetched feeds into:
+     - Top Engineering & Systems
+     - AI & Tooling
+     - Security & Infrastructure
+  2. Skip fluff and duplicates; keep each bullet to 1-2 crisp sentences with the source link.
+  3. End with a short "One Thing Worth Reading Deeply" pick.
+
+  {{sources}}

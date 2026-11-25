@@ -1,0 +1,19 @@
+title: "PS5 Price Watch"
+description: "Only emits a feed item when notable PS5 Slim/Pro discounts appear."
+category: "Travel & Deals"
+enabled: false
+schedule: "0 8,18 * * *"
+provider: "openai_search"
+web_search: true
+# If the LLM decides nothing meets the threshold, suppress noisy feed items:
+skip_if_contains: "NO_UPDATE"
+deduplicate: true
+
+prompt: |
+  Today is {{date}}. Search major Polish/EU electronics retailers (Media Expert, RTV Euro AGD,
+  x-kom, Amazon.pl, Amazon.de) for current PlayStation 5 Slim Disc and PS5 Pro prices.
+
+  If there is NO genuine deal below 2,000 PLN (PS5 Slim Disc) or 3,200 PLN (PS5 Pro),
+  reply with exactly: NO_UPDATE
+
+  Otherwise, list the qualifying deals in a Markdown table with retailer, model, price, and URL.
