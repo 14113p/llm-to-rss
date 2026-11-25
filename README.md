@@ -50,6 +50,8 @@ flowchart LR
    # docker compose --profile freshrss up -d --build
    ```
 
+   If you push this repository as a **public** GitHub repo, [`.github/workflows/docker.yml`](.github/workflows/docker.yml) automatically builds and publishes free multi-arch (`linux/amd64`, `linux/arm64`) images to `ghcr.io/<your-user>/llm-to-rss:latest`, which you can reference with `image: ghcr.io/<your-user>/llm-to-rss:latest` in your homelab `docker-compose.yml` instead of building locally.
+
 4. Trigger an initial run (optional, so feeds already have items before their next cron tick):
 
    ```bash
