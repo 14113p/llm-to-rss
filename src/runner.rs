@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, FeedConfig};
 use crate::error::{AppError, Result};
-use crate::fetcher::fetch_sources;
+use crate::fetcher::{fetch_sources, FetchOptions};
 use crate::llm::{self, LlmRequest};
 use crate::render::{render_entry_html, render_prompt, PromptContext};
 use crate::store::{FeedEntry, Store};
@@ -89,7 +89,14 @@ async fn run_feed_inner(
 
     info!(feed_id = %feed.id, provider = %feed.provider, "running virtual feed");
 
-    let fetched = fetch_sources(client, &feed.id, &feed.sources, store).await?;
+    let timeout = Duration::from_secs(config.defaults.timeout_secs);
+    let retry = config.defaults.retry_policy();
+    let fetch_opts = FetchOptions {
+        timeout: timeout.min(Duration::from_secs(60)),
+        retry,
+        fail_on_source_error: feed.effective_fail_on_source_error(&config.defaults),
+    };
+    let fetched = fetch_sources(client, &feed.id, &feed.sources, store, fetch_opts).await?;
 
     if feed.skip_if_no_new_items
         && fetched.tracked_rss_sources > 0
@@ -135,8 +142,8 @@ async fn run_feed_inner(
         max_tokens: provider.max_tokens,
     };
 
-    let timeout = Duration::from_secs(config.defaults.timeout_secs);
-    let llm_resp = llm::generate(client, &feed.provider, provider, &llm_req, timeout).await?;
+    let llm_resp =
+        llm::generate(client, &feed.provider, provider, &llm_req, timeout, retry).await?;
 
     if let Some(marker) = &feed.skip_if_contains {
         if !marker.is_empty() && llm_resp.text.contains(marker) {

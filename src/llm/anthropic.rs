@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 
 use crate::config::ProviderConfig;
 use crate::error::{AppError, Result};
-use crate::llm::{dedupe_citations, require_api_key, LlmRequest, LlmResponse};
+use crate::http::{send_with_retry, RetryPolicy};
+use crate::llm::{
+    decode_json_response, dedupe_citations, require_api_key, LlmRequest, LlmResponse,
+};
 use crate::store::Citation;
 
 pub async fn call(
@@ -14,6 +17,7 @@ pub async fn call(
     provider: &ProviderConfig,
     req: &LlmRequest,
     timeout: Duration,
+    retry: RetryPolicy,
 ) -> Result<LlmResponse> {
     let api_key = require_api_key(provider_name, provider)?;
     let endpoint = format!("{}/messages", provider.effective_base_url());
@@ -43,32 +47,24 @@ pub async fn call(
         }]);
     }
 
-    let mut http_req = client
-        .post(&endpoint)
-        .timeout(timeout)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body);
-    for (k, v) in &provider.extra_headers {
-        http_req = http_req.header(k, v);
-    }
-
-    let resp = http_req.send().await.map_err(|e| AppError::Provider {
+    let resp = send_with_retry(provider_name, retry, || {
+        let mut http_req = client
+            .post(&endpoint)
+            .timeout(timeout)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body);
+        for (k, v) in &provider.extra_headers {
+            http_req = http_req.header(k, v);
+        }
+        http_req
+    })
+    .await
+    .map_err(|e| AppError::Provider {
         provider: provider_name.to_string(),
         message: e.to_string(),
     })?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.map_err(|e| AppError::Provider {
-        provider: provider_name.to_string(),
-        message: format!("invalid JSON response ({status}): {e}"),
-    })?;
-
-    if !status.is_success() {
-        return Err(AppError::Provider {
-            provider: provider_name.to_string(),
-            message: format!("HTTP {status}: {payload}"),
-        });
-    }
+    let payload: Value = decode_json_response(provider_name, resp).await?;
 
     let mut parts = Vec::new();
     let mut citations = Vec::new();

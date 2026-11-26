@@ -135,6 +135,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
             limit: Some(5),
             only_new: false,
         }],
+        fail_on_source_error: None,
         skip_if_contains: None,
         skip_if_no_new_items: false,
         deduplicate: true,
@@ -157,6 +158,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
         prompt: "Check PS5 price".to_string(),
         entry_title_template: None,
         sources: vec![],
+        fail_on_source_error: None,
         skip_if_contains: Some("NO_UPDATE".to_string()),
         skip_if_no_new_items: false,
         deduplicate: false,
@@ -334,6 +336,7 @@ async fn passes_previous_entry_into_subsequent_prompt() {
         prompt: "Check price.\n\nPrevious:\n{{previous_entry}}".to_string(),
         entry_title_template: None,
         sources: vec![],
+        fail_on_source_error: None,
         skip_if_contains: None,
         skip_if_no_new_items: false,
         deduplicate: false,
@@ -470,6 +473,7 @@ async fn tracks_seen_rss_items_across_runs() {
             limit: Some(10),
             only_new: true,
         }],
+        fail_on_source_error: None,
         skip_if_contains: None,
         skip_if_no_new_items: true,
         deduplicate: false,
@@ -533,4 +537,268 @@ async fn tracks_seen_rss_items_across_runs() {
     assert!(prompts[0].contains("Article A"));
     assert!(prompts[2].contains("Article B"));
     assert!(!prompts[2].contains("Article A"));
+}
+
+#[tokio::test]
+async fn retries_transient_llm_and_source_errors() {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let rss_attempts = Arc::new(AtomicUsize::new(0));
+    let rss_attempts_clone = Arc::clone(&rss_attempts);
+    let llm_attempts = Arc::new(AtomicUsize::new(0));
+    let llm_attempts_clone = Arc::clone(&llm_attempts);
+
+    let app = Router::new()
+        .route(
+            "/flaky.rss",
+            get(move || {
+                let attempts = Arc::clone(&rss_attempts_clone);
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "temporary outage")
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Flaky</title><link>https://example.com</link><description>d</description><item><guid>g1</guid><title>Recovered Item</title><link>https://example.com/1</link></item></channel></rss>"#,
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let attempts = Arc::clone(&llm_attempts_clone);
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, "0")],
+                            "rate limited",
+                        )
+                            .into_response();
+                    }
+                    if n == 1 {
+                        return (StatusCode::BAD_GATEWAY, "<html>bad gateway</html>")
+                            .into_response();
+                    }
+                    Json(json!({
+                        "model": "llama3.2",
+                        "choices": [{ "message": { "content": "# Recovered\n\nAll good." } }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "local".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenaiCompatible,
+            model: "llama3.2".to_string(),
+            api_key: None,
+            base_url: Some(format!("http://{addr}/v1")),
+            web_search: false,
+            temperature: None,
+            max_tokens: None,
+            extra_headers: BTreeMap::new(),
+        },
+    );
+
+    let feed = FeedConfig {
+        id: "retry-feed".to_string(),
+        title: "Retry Test".to_string(),
+        description: None,
+        category: None,
+        enabled: true,
+        schedule: "0 8 * * *".to_string(),
+        timezone: Some("UTC".to_string()),
+        provider: "local".to_string(),
+        model: None,
+        web_search: None,
+        system_prompt: None,
+        prompt: "Summarize:\n{{sources}}".to_string(),
+        entry_title_template: None,
+        sources: vec![SourceConfig::Rss {
+            name: "Flaky".to_string(),
+            url: format!("http://{addr}/flaky.rss"),
+            limit: Some(5),
+            only_new: true,
+        }],
+        fail_on_source_error: None,
+        skip_if_contains: None,
+        skip_if_no_new_items: false,
+        deduplicate: false,
+        max_items: Some(10),
+        run_on_startup: false,
+    };
+
+    let config = AppConfig {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            db_path: dir.path().join("retry.db"),
+        },
+        defaults: DefaultsConfig {
+            max_retries: 3,
+            retry_base_delay_ms: 10,
+            ..DefaultsConfig::default()
+        },
+        feeds_dir: None,
+        providers,
+        feeds: vec![feed.clone()],
+    };
+
+    let client = Client::builder().no_proxy().build().unwrap();
+    let store = Store::open(&config.storage.db_path).unwrap();
+
+    let outcome = run_feed(&config, &feed, &client, &store, false)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RunOutcome::Published(_)));
+    assert_eq!(rss_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(llm_attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn continues_when_fail_on_source_error_is_false() {
+    let seen_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let prompts_clone = Arc::clone(&seen_prompts);
+
+    let app = Router::new()
+        .route(
+            "/broken.rss",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        )
+        .route(
+            "/healthy.rss",
+            get(|| async {
+                r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Good</title><link>https://example.com</link><description>d</description><item><guid>ok-1</guid><title>Healthy Headline</title><link>https://example.com/ok</link></item></channel></rss>"#
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let prompts = Arc::clone(&prompts_clone);
+                async move {
+                    let user_msg = body["messages"]
+                        .as_array()
+                        .and_then(|arr| arr.iter().find(|m| m["role"] == "user"))
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    prompts.lock().unwrap().push(user_msg);
+                    Json(json!({
+                        "model": "llama3.2",
+                        "choices": [{ "message": { "content": "# Partial Briefing\n\nHealthy Headline." } }]
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "local".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenaiCompatible,
+            model: "llama3.2".to_string(),
+            api_key: None,
+            base_url: Some(format!("http://{addr}/v1")),
+            web_search: false,
+            temperature: None,
+            max_tokens: None,
+            extra_headers: BTreeMap::new(),
+        },
+    );
+
+    let base_feed = FeedConfig {
+        id: "partial-feed".to_string(),
+        title: "Partial Test".to_string(),
+        description: None,
+        category: None,
+        enabled: true,
+        schedule: "0 8 * * *".to_string(),
+        timezone: Some("UTC".to_string()),
+        provider: "local".to_string(),
+        model: None,
+        web_search: None,
+        system_prompt: None,
+        prompt: "Summarize:\n{{sources}}".to_string(),
+        entry_title_template: None,
+        sources: vec![
+            SourceConfig::Rss {
+                name: "Broken Source".to_string(),
+                url: format!("http://{addr}/broken.rss"),
+                limit: Some(5),
+                only_new: true,
+            },
+            SourceConfig::Rss {
+                name: "Healthy Source".to_string(),
+                url: format!("http://{addr}/healthy.rss"),
+                limit: Some(5),
+                only_new: true,
+            },
+        ],
+        fail_on_source_error: Some(true),
+        skip_if_contains: None,
+        skip_if_no_new_items: false,
+        deduplicate: false,
+        max_items: Some(10),
+        run_on_startup: false,
+    };
+
+    let config = AppConfig {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            db_path: dir.path().join("partial.db"),
+        },
+        defaults: DefaultsConfig {
+            max_retries: 0,
+            retry_base_delay_ms: 1,
+            ..DefaultsConfig::default()
+        },
+        feeds_dir: None,
+        providers,
+        feeds: vec![base_feed.clone()],
+    };
+
+    let client = Client::builder().no_proxy().build().unwrap();
+    let store = Store::open(&config.storage.db_path).unwrap();
+
+    // Strict mode fails
+    assert!(run_feed(&config, &base_feed, &client, &store, false)
+        .await
+        .is_err());
+
+    // Tolerant mode succeeds and includes healthy source + unavailability note
+    let mut tolerant = base_feed;
+    tolerant.fail_on_source_error = Some(false);
+    let outcome = run_feed(&config, &tolerant, &client, &store, false)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RunOutcome::Published(_)));
+
+    let prompts = seen_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("Healthy Headline"));
+    assert!(prompts[0].contains("[Source unavailable:"));
 }

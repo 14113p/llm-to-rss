@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod fetcher;
+pub mod http;
 pub mod llm;
 pub mod render;
 pub mod runner;

@@ -70,6 +70,12 @@ pub struct DefaultsConfig {
     pub max_items: usize,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub retry_base_delay_ms: u64,
+    #[serde(default = "default_true")]
+    pub fail_on_source_error: bool,
 }
 
 impl Default for DefaultsConfig {
@@ -78,6 +84,18 @@ impl Default for DefaultsConfig {
             timezone: default_timezone(),
             max_items: default_max_items(),
             timeout_secs: default_timeout_secs(),
+            max_retries: default_max_retries(),
+            retry_base_delay_ms: default_retry_base_delay_ms(),
+            fail_on_source_error: true,
+        }
+    }
+}
+
+impl DefaultsConfig {
+    pub fn retry_policy(&self) -> crate::http::RetryPolicy {
+        crate::http::RetryPolicy {
+            max_retries: self.max_retries,
+            base_delay: std::time::Duration::from_millis(self.retry_base_delay_ms),
         }
     }
 }
@@ -151,6 +169,9 @@ pub struct FeedConfig {
     pub entry_title_template: Option<String>,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// Override `defaults.fail_on_source_error` for this feed. When false, source fetch failures are logged and skipped.
+    #[serde(default)]
+    pub fail_on_source_error: Option<bool>,
     #[serde(default)]
     pub skip_if_contains: Option<String>,
     /// Skip calling the LLM when all `only_new: true` RSS sources have zero unseen items.
@@ -167,6 +188,11 @@ pub struct FeedConfig {
 impl FeedConfig {
     pub fn effective_max_items(&self, defaults: &DefaultsConfig) -> usize {
         self.max_items.unwrap_or(defaults.max_items)
+    }
+
+    pub fn effective_fail_on_source_error(&self, defaults: &DefaultsConfig) -> bool {
+        self.fail_on_source_error
+            .unwrap_or(defaults.fail_on_source_error)
     }
 
     pub fn effective_timezone(&self, defaults: &DefaultsConfig) -> Result<Tz> {
@@ -233,6 +259,14 @@ fn default_max_items() -> usize {
 
 fn default_timeout_secs() -> u64 {
     90
+}
+
+fn default_max_retries() -> usize {
+    3
+}
+
+fn default_retry_base_delay_ms() -> u64 {
+    1_000
 }
 
 fn default_true() -> bool {

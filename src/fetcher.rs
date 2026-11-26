@@ -4,13 +4,32 @@ use std::time::Duration;
 use regex::Regex;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::config::SourceConfig;
 use crate::error::{AppError, Result};
+use crate::http::{send_with_retry, RetryPolicy};
 use crate::store::{SeenSourceItem, Store};
 
 const DEFAULT_MAX_CHARS: usize = 12_000;
 const DEFAULT_RSS_LIMIT: usize = 15;
+
+#[derive(Debug, Clone, Copy)]
+pub struct FetchOptions {
+    pub timeout: Duration,
+    pub retry: RetryPolicy,
+    pub fail_on_source_error: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
+            fail_on_source_error: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FetchedSource {
@@ -32,6 +51,7 @@ pub async fn fetch_sources(
     feed_id: &str,
     sources: &[SourceConfig],
     store: &Store,
+    options: FetchOptions,
 ) -> Result<FetchOutput> {
     let mut output = FetchOutput {
         sources: Vec::with_capacity(sources.len()),
@@ -47,14 +67,36 @@ pub async fn fetch_sources(
                 max_chars,
                 headers,
             } => {
-                let content =
-                    fetch_url_source(client, url, max_chars.unwrap_or(DEFAULT_MAX_CHARS), headers)
-                        .await?;
-                output.sources.push(FetchedSource {
-                    name: name.clone(),
-                    url: url.clone(),
-                    content,
-                });
+                match fetch_url_source(
+                    client,
+                    url,
+                    max_chars.unwrap_or(DEFAULT_MAX_CHARS),
+                    headers,
+                    options,
+                )
+                .await
+                {
+                    Ok(content) => output.sources.push(FetchedSource {
+                        name: name.clone(),
+                        url: url.clone(),
+                        content,
+                    }),
+                    Err(err) if !options.fail_on_source_error => {
+                        warn!(
+                            feed_id = %feed_id,
+                            source = %name,
+                            url = %url,
+                            error = %err,
+                            "URL source fetch failed; continuing"
+                        );
+                        output.sources.push(FetchedSource {
+                            name: name.clone(),
+                            url: url.clone(),
+                            content: format!("[Source unavailable: {err}]"),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             SourceConfig::Rss {
                 name,
@@ -63,34 +105,52 @@ pub async fn fetch_sources(
                 only_new,
             } => {
                 let seen_keys = if *only_new {
-                    output.tracked_rss_sources += 1;
                     Some(store.seen_item_keys(feed_id, url)?)
                 } else {
                     None
                 };
 
-                let (content, new_keys) = fetch_rss_source(
+                match fetch_rss_source(
                     client,
                     url,
                     limit.unwrap_or(DEFAULT_RSS_LIMIT),
                     seen_keys.as_ref(),
+                    options,
                 )
-                .await?;
-
-                if *only_new {
-                    for key in new_keys {
-                        output.new_rss_items.push(SeenSourceItem {
-                            source_url: url.clone(),
-                            item_key: key,
+                .await
+                {
+                    Ok((content, new_keys)) => {
+                        if *only_new {
+                            output.tracked_rss_sources += 1;
+                            for key in new_keys {
+                                output.new_rss_items.push(SeenSourceItem {
+                                    source_url: url.clone(),
+                                    item_key: key,
+                                });
+                            }
+                        }
+                        output.sources.push(FetchedSource {
+                            name: name.clone(),
+                            url: url.clone(),
+                            content,
                         });
                     }
+                    Err(err) if !options.fail_on_source_error => {
+                        warn!(
+                            feed_id = %feed_id,
+                            source = %name,
+                            url = %url,
+                            error = %err,
+                            "RSS source fetch failed; continuing"
+                        );
+                        output.sources.push(FetchedSource {
+                            name: name.clone(),
+                            url: url.clone(),
+                            content: format!("[Source unavailable: {err}]"),
+                        });
+                    }
+                    Err(err) => return Err(err),
                 }
-
-                output.sources.push(FetchedSource {
-                    name: name.clone(),
-                    url: url.clone(),
-                    content,
-                });
             }
         }
     }
@@ -103,16 +163,20 @@ async fn fetch_url_source(
     url: &str,
     max_chars: usize,
     headers: &std::collections::BTreeMap<String, String>,
+    options: FetchOptions,
 ) -> Result<String> {
-    let mut req = client
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        .header("User-Agent", "llm-to-rss/0.1 (+https://github.com)");
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-
-    let resp = req.send().await.map_err(|e| AppError::Fetch {
+    let resp = send_with_retry(url, options.retry, || {
+        let mut req = client
+            .get(url)
+            .timeout(options.timeout)
+            .header("User-Agent", "llm-to-rss/0.1 (+https://github.com)");
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req
+    })
+    .await
+    .map_err(|e| AppError::Fetch {
         url: url.to_string(),
         message: e.to_string(),
     })?;
@@ -150,17 +214,19 @@ async fn fetch_rss_source(
     url: &str,
     limit: usize,
     seen_keys: Option<&HashSet<String>>,
+    options: FetchOptions,
 ) -> Result<(String, Vec<String>)> {
-    let resp = client
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        .header("User-Agent", "llm-to-rss/0.1 (+https://github.com)")
-        .send()
-        .await
-        .map_err(|e| AppError::Fetch {
-            url: url.to_string(),
-            message: e.to_string(),
-        })?;
+    let resp = send_with_retry(url, options.retry, || {
+        client
+            .get(url)
+            .timeout(options.timeout)
+            .header("User-Agent", "llm-to-rss/0.1 (+https://github.com)")
+    })
+    .await
+    .map_err(|e| AppError::Fetch {
+        url: url.to_string(),
+        message: e.to_string(),
+    })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(AppError::Fetch {

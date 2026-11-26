@@ -9,6 +9,7 @@ use reqwest::Client;
 
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::error::{AppError, Result};
+use crate::http::RetryPolicy;
 use crate::store::Citation;
 
 #[derive(Debug, Clone)]
@@ -35,17 +36,20 @@ pub async fn generate(
     provider: &ProviderConfig,
     req: &LlmRequest,
     timeout: Duration,
+    retry: RetryPolicy,
 ) -> Result<LlmResponse> {
     match provider.kind {
         ProviderKind::OpenaiCompatible => {
-            openai_compatible::call(client, provider_name, provider, req, timeout).await
+            openai_compatible::call(client, provider_name, provider, req, timeout, retry).await
         }
         ProviderKind::OpenaiResponses => {
-            openai_responses::call(client, provider_name, provider, req, timeout).await
+            openai_responses::call(client, provider_name, provider, req, timeout, retry).await
         }
-        ProviderKind::Gemini => gemini::call(client, provider_name, provider, req, timeout).await,
+        ProviderKind::Gemini => {
+            gemini::call(client, provider_name, provider, req, timeout, retry).await
+        }
         ProviderKind::Anthropic => {
-            anthropic::call(client, provider_name, provider, req, timeout).await
+            anthropic::call(client, provider_name, provider, req, timeout, retry).await
         }
     }
 }
@@ -63,6 +67,29 @@ pub(crate) fn require_api_key<'a>(
             provider: provider_name.to_string(),
             message: "api_key is missing or empty (check your environment variables)".to_string(),
         })
+}
+
+pub(crate) async fn decode_json_response(
+    provider_name: &str,
+    resp: reqwest::Response,
+) -> Result<serde_json::Value> {
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| AppError::Provider {
+        provider: provider_name.to_string(),
+        message: format!("failed to read response body ({status}): {e}"),
+    })?;
+
+    if !status.is_success() {
+        return Err(AppError::Provider {
+            provider: provider_name.to_string(),
+            message: format!("HTTP {status}: {body}"),
+        });
+    }
+
+    serde_json::from_str(&body).map_err(|e| AppError::Provider {
+        provider: provider_name.to_string(),
+        message: format!("invalid JSON response ({status}): {e}"),
+    })
 }
 
 pub(crate) fn dedupe_citations(citations: Vec<Citation>) -> Vec<Citation> {

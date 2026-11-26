@@ -350,6 +350,7 @@ mod tests {
             prompt: "Summarize news for {{date}}".into(),
             entry_title_template: None,
             sources: vec![],
+            fail_on_source_error: None,
             skip_if_contains: None,
             skip_if_no_new_items: false,
             deduplicate: false,

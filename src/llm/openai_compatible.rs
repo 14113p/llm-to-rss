@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 
 use crate::config::ProviderConfig;
 use crate::error::{AppError, Result};
-use crate::llm::{dedupe_citations, LlmRequest, LlmResponse};
+use crate::http::{send_with_retry, RetryPolicy};
+use crate::llm::{decode_json_response, dedupe_citations, LlmRequest, LlmResponse};
 use crate::store::Citation;
 
 pub async fn call(
@@ -14,6 +15,7 @@ pub async fn call(
     provider: &ProviderConfig,
     req: &LlmRequest,
     timeout: Duration,
+    retry: RetryPolicy,
 ) -> Result<LlmResponse> {
     let endpoint = format!("{}/chat/completions", provider.effective_base_url());
 
@@ -36,35 +38,28 @@ pub async fn call(
         body["max_tokens"] = json!(max);
     }
 
-    let mut http_req = client.post(&endpoint).timeout(timeout).json(&body);
-    if let Some(key) = provider
+    let auth_key = provider
         .api_key
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        http_req = http_req.bearer_auth(key);
-    }
-    for (k, v) in &provider.extra_headers {
-        http_req = http_req.header(k, v);
-    }
+        .filter(|s| !s.is_empty());
 
-    let resp = http_req.send().await.map_err(|e| AppError::Provider {
+    let resp = send_with_retry(provider_name, retry, || {
+        let mut http_req = client.post(&endpoint).timeout(timeout).json(&body);
+        if let Some(key) = auth_key {
+            http_req = http_req.bearer_auth(key);
+        }
+        for (k, v) in &provider.extra_headers {
+            http_req = http_req.header(k, v);
+        }
+        http_req
+    })
+    .await
+    .map_err(|e| AppError::Provider {
         provider: provider_name.to_string(),
         message: e.to_string(),
     })?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.map_err(|e| AppError::Provider {
-        provider: provider_name.to_string(),
-        message: format!("invalid JSON response ({status}): {e}"),
-    })?;
-
-    if !status.is_success() {
-        return Err(AppError::Provider {
-            provider: provider_name.to_string(),
-            message: format!("HTTP {status}: {payload}"),
-        });
-    }
+    let payload: Value = decode_json_response(provider_name, resp).await?;
 
     let text = payload["choices"][0]["message"]["content"]
         .as_str()
