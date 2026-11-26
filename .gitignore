@@ -7,3 +7,4 @@ Cargo.lock
 config.yaml
 data/
 .DS_Store
+GEMINI.md
