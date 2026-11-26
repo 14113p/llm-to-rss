@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -14,6 +16,50 @@ use crate::render::{render_entry_html, render_prompt, PromptContext};
 use crate::store::{FeedEntry, Store};
 
 const MAX_SEEN_ITEMS_PER_SOURCE: usize = 2_000;
+
+/// Tracks currently executing feeds so manual triggers and scheduled runs do not overlap.
+#[derive(Clone, Default)]
+pub struct RunTracker {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+}
+
+pub struct RunPermit {
+    feed_id: String,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.in_flight.lock() {
+            guard.remove(&self.feed_id);
+        }
+    }
+}
+
+impl RunTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn try_acquire(&self, feed_id: &str) -> Option<RunPermit> {
+        let mut guard = self.in_flight.lock().expect("run tracker mutex poisoned");
+        if guard.insert(feed_id.to_string()) {
+            Some(RunPermit {
+                feed_id: feed_id.to_string(),
+                in_flight: Arc::clone(&self.in_flight),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn is_running(&self, feed_id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .expect("run tracker mutex poisoned")
+            .contains(feed_id)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
@@ -239,4 +285,26 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_tracker_prevents_overlapping_runs_and_releases_on_drop() {
+        let tracker = RunTracker::new();
+        assert!(!tracker.is_running("briefing"));
+
+        {
+            let permit = tracker.try_acquire("briefing");
+            assert!(permit.is_some());
+            assert!(tracker.is_running("briefing"));
+            assert!(tracker.try_acquire("briefing").is_none());
+            assert!(tracker.try_acquire("other").is_some());
+        }
+
+        assert!(!tracker.is_running("briefing"));
+        assert!(tracker.try_acquire("briefing").is_some());
+    }
 }

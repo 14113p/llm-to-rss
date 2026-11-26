@@ -33,7 +33,8 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// Optional bearer token protecting `POST /feeds/{id}/run`. If unset, manual HTTP triggers are disabled.
+    /// Optional bearer token protecting manual HTTP triggers (`POST /feeds/{id}/run`, `POST /reload`).
+    /// If unset, manual triggers are allowed without authentication (intended for trusted LAN deployments).
     #[serde(default)]
     pub trigger_token: Option<String>,
     /// Interval in seconds to poll `config.yaml` and `feeds_dir` for hot-reload (0 disables polling; SIGHUP still reloads).

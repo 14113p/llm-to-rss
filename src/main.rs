@@ -14,7 +14,7 @@ use llm_to_rss::cli::{Cli, Command};
 use llm_to_rss::config::AppConfig;
 use llm_to_rss::reload::{spawn_config_watcher, ConfigHandle};
 use llm_to_rss::render::build_opml;
-use llm_to_rss::runner::{run_all_feeds, run_feed, RunOutcome};
+use llm_to_rss::runner::{run_all_feeds, run_feed, RunOutcome, RunTracker};
 use llm_to_rss::scheduler::spawn_scheduler;
 use llm_to_rss::server::{router, AppState};
 use llm_to_rss::store::Store;
@@ -89,12 +89,14 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open(&config.storage.db_path)?;
 
             let config_handle = ConfigHandle::new(Arc::clone(&config), cli.config.clone());
+            let runs = RunTracker::new();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let scheduler_handle = spawn_scheduler(
                 config_handle.clone(),
                 client.clone(),
                 store.clone(),
+                runs.clone(),
                 shutdown_rx.clone(),
             );
             let watcher_handle = spawn_config_watcher(
@@ -107,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
                 config: config_handle,
                 client,
                 store,
+                runs,
             };
 
             let app = router(state);

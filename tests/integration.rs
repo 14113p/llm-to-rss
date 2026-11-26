@@ -14,7 +14,7 @@ use llm_to_rss::config::{
     SourceConfig, StorageConfig,
 };
 use llm_to_rss::reload::{spawn_config_watcher, ConfigHandle};
-use llm_to_rss::runner::{run_feed, RunOutcome};
+use llm_to_rss::runner::{run_feed, RunOutcome, RunTracker};
 use llm_to_rss::server::{router, AppState};
 use llm_to_rss::store::Store;
 
@@ -210,6 +210,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
         config: ConfigHandle::static_config(Arc::clone(&config)),
         client,
         store,
+        runs: RunTracker::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -251,6 +252,18 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
     assert!(opml_body.contains("ps5-watch.xml"));
 
     // Auth check on trigger endpoint
+    let dash_html = http
+        .get(format!("http://{server_addr}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dash_html.contains("data-feed-id=\"morning-briefing\""));
+    assert!(dash_html.contains("id=\"trigger-token\""));
+    assert!(!dash_html.contains("secret-token"));
+
     let unauth = http
         .post(format!("http://{server_addr}/feeds/morning-briefing/run"))
         .send()
@@ -265,6 +278,9 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
         .await
         .unwrap();
     assert_eq!(auth.status(), StatusCode::OK);
+    let auth_json: Value = auth.json().await.unwrap();
+    assert_eq!(auth_json["status"], "skipped");
+    assert_eq!(auth_json["items"], 1);
 }
 
 #[tokio::test]
@@ -844,6 +860,7 @@ async fn hot_reloads_new_feed_into_live_http_server() {
         config: config_handle,
         client: Client::builder().no_proxy().build().unwrap(),
         store,
+        runs: RunTracker::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -894,4 +911,116 @@ async fn hot_reloads_new_feed_into_live_http_server() {
 
     let _ = shutdown_tx.send(true);
     watcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn dashboard_allows_manual_trigger_without_token_and_guards_concurrency() {
+    let mock_base = start_mock_upstream().await;
+    let dir = tempdir().unwrap();
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenaiResponses,
+            model: "gpt-4o".to_string(),
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("{mock_base}/v1")),
+            web_search: true,
+            temperature: None,
+            max_tokens: None,
+            extra_headers: BTreeMap::new(),
+        },
+    );
+
+    let feed = FeedConfig {
+        id: "manual-feed".to_string(),
+        title: "Manual Feed".to_string(),
+        description: None,
+        category: None,
+        enabled: true,
+        schedule: "0 7 * * *".to_string(),
+        timezone: Some("UTC".to_string()),
+        provider: "openai".to_string(),
+        model: None,
+        web_search: None,
+        system_prompt: None,
+        prompt: "Summarize:\n{{sources}}".to_string(),
+        entry_title_template: None,
+        sources: vec![SourceConfig::Rss {
+            name: "Mock Tech".to_string(),
+            url: format!("{mock_base}/source.rss"),
+            limit: Some(5),
+            only_new: false,
+        }],
+        fail_on_source_error: None,
+        skip_if_contains: None,
+        skip_if_no_new_items: false,
+        deduplicate: false,
+        max_items: Some(10),
+        run_on_startup: false,
+    };
+
+    let config = Arc::new(AppConfig {
+        server: ServerConfig {
+            trigger_token: None,
+            ..ServerConfig::default()
+        },
+        storage: StorageConfig {
+            db_path: dir.path().join("manual.db"),
+        },
+        defaults: DefaultsConfig::default(),
+        feeds_dir: None,
+        providers,
+        feeds: vec![feed],
+    });
+
+    let runs = RunTracker::new();
+    let state = AppState {
+        config: ConfigHandle::static_config(Arc::clone(&config)),
+        client: Client::builder().no_proxy().build().unwrap(),
+        store: Store::open(&config.storage.db_path).unwrap(),
+        runs: runs.clone(),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    let http = Client::builder().no_proxy().build().unwrap();
+    let dash_html = http
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dash_html.contains("data-feed-id=\"manual-feed\""));
+    assert!(dash_html.contains("Run now"));
+    assert!(!dash_html.contains("id=\"trigger-token\""));
+
+    // Hold a permit to verify 409 Conflict while feed is already running
+    let permit = runs.try_acquire("manual-feed").unwrap();
+    let conflict = http
+        .post(format!("http://{addr}/feeds/manual-feed/run"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    drop(permit);
+
+    // Trigger without token succeeds and publishes entry
+    let resp = http
+        .post(format!("http://{addr}/feeds/manual-feed/run"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "published");
+    assert_eq!(body["items"], 1);
+    assert!(body["last_run"].as_str().unwrap_or("").starts_with("ok "));
 }
