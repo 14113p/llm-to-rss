@@ -13,6 +13,7 @@ use llm_to_rss::config::{
     AppConfig, DefaultsConfig, FeedConfig, ProviderConfig, ProviderKind, ServerConfig,
     SourceConfig, StorageConfig,
 };
+use llm_to_rss::reload::{spawn_config_watcher, ConfigHandle};
 use llm_to_rss::runner::{run_feed, RunOutcome};
 use llm_to_rss::server::{router, AppState};
 use llm_to_rss::store::Store;
@@ -171,6 +172,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
             bind: "127.0.0.1:0".to_string(),
             base_url: "http://localhost:8080".to_string(),
             trigger_token: Some("secret-token".to_string()),
+            reload_interval_secs: 2,
         },
         storage: StorageConfig {
             db_path: dir.path().join("feeds.db"),
@@ -205,7 +207,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
 
     // 4. Verify HTTP endpoints
     let state = AppState {
-        config: Arc::clone(&config),
+        config: ConfigHandle::static_config(Arc::clone(&config)),
         client,
         store,
     };
@@ -801,4 +803,95 @@ async fn continues_when_fail_on_source_error_is_false() {
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("Healthy Headline"));
     assert!(prompts[0].contains("[Source unavailable:"));
+}
+
+#[tokio::test]
+async fn hot_reloads_new_feed_into_live_http_server() {
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    let dir = tempdir().unwrap();
+    let feeds_dir = dir.path().join("feeds");
+    std::fs::create_dir_all(&feeds_dir).unwrap();
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage:\n  db_path: '{}'\nfeeds_dir: feeds\nproviders:\n  local:\n    kind: openai_compatible\n    model: llama3.2\n",
+            dir.path().join("hot.db").display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        feeds_dir.join("initial.yaml"),
+        "title: Initial Feed\nschedule: '0 7 * * *'\nprovider: local\nprompt: hello\n",
+    )
+    .unwrap();
+
+    let loaded = Arc::new(AppConfig::load(&config_path).unwrap());
+    let store = Store::open(&loaded.storage.db_path).unwrap();
+    let config_handle = ConfigHandle::new(loaded, config_path);
+    let mut cfg_rx = config_handle.subscribe();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = spawn_config_watcher(
+        config_handle.clone(),
+        Duration::from_millis(40),
+        shutdown_rx,
+    );
+
+    let state = AppState {
+        config: config_handle,
+        client: Client::builder().no_proxy().build().unwrap(),
+        store,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    let http = Client::builder().no_proxy().build().unwrap();
+    let before: Value = http
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["feeds_total"], 1);
+
+    // Drop a brand-new feed YAML into feeds/ without restarting the server
+    std::fs::write(
+        feeds_dir.join("added-live.yaml"),
+        "title: Added Live\nschedule: '0 8 * * *'\nprovider: local\nprompt: live\n",
+    )
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), cfg_rx.changed())
+        .await
+        .expect("server config should hot-reload")
+        .unwrap();
+
+    let after: Value = http
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["feeds_total"], 2);
+
+    let feed_resp = http
+        .get(format!("http://{addr}/feeds/added-live.xml"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(feed_resp.status(), StatusCode::OK);
+    assert!(feed_resp.text().await.unwrap().contains("Added Live"));
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.unwrap();
 }

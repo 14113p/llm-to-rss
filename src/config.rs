@@ -36,6 +36,9 @@ pub struct ServerConfig {
     /// Optional bearer token protecting `POST /feeds/{id}/run`. If unset, manual HTTP triggers are disabled.
     #[serde(default)]
     pub trigger_token: Option<String>,
+    /// Interval in seconds to poll `config.yaml` and `feeds_dir` for hot-reload (0 disables polling; SIGHUP still reloads).
+    #[serde(default = "default_reload_interval_secs")]
+    pub reload_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +47,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             base_url: default_base_url(),
             trigger_token: None,
+            reload_interval_secs: default_reload_interval_secs(),
         }
     }
 }
@@ -243,6 +247,10 @@ fn default_bind() -> String {
 
 fn default_base_url() -> String {
     std::env::var("LLM_TO_RSS_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+}
+
+fn default_reload_interval_secs() -> u64 {
+    2
 }
 
 fn default_db_path() -> PathBuf {

@@ -4,6 +4,7 @@ pub mod error;
 pub mod fetcher;
 pub mod http;
 pub mod llm;
+pub mod reload;
 pub mod render;
 pub mod runner;
 pub mod scheduler;

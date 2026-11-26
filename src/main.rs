@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -11,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use llm_to_rss::cli::{Cli, Command};
 use llm_to_rss::config::AppConfig;
+use llm_to_rss::reload::{spawn_config_watcher, ConfigHandle};
 use llm_to_rss::render::build_opml;
 use llm_to_rss::runner::{run_all_feeds, run_feed, RunOutcome};
 use llm_to_rss::scheduler::spawn_scheduler;
@@ -86,16 +88,23 @@ async fn main() -> anyhow::Result<()> {
             let client = Client::builder().build()?;
             let store = Store::open(&config.storage.db_path)?;
 
+            let config_handle = ConfigHandle::new(Arc::clone(&config), cli.config.clone());
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let scheduler_handles = spawn_scheduler(
-                Arc::clone(&config),
+
+            let scheduler_handle = spawn_scheduler(
+                config_handle.clone(),
                 client.clone(),
                 store.clone(),
+                shutdown_rx.clone(),
+            );
+            let watcher_handle = spawn_config_watcher(
+                config_handle.clone(),
+                Duration::from_secs(config.server.reload_interval_secs),
                 shutdown_rx,
             );
 
             let state = AppState {
-                config: Arc::clone(&config),
+                config: config_handle,
                 client,
                 store,
             };
@@ -104,16 +113,22 @@ async fn main() -> anyhow::Result<()> {
             let listener = TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("failed to bind {}", config.server.bind))?;
-            info!(bind = %config.server.bind, base_url = %config.server.base_url, "listening");
+            info!(
+                bind = %config.server.bind,
+                base_url = %config.server.base_url,
+                reload_interval_secs = config.server.reload_interval_secs,
+                "listening"
+            );
 
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal(shutdown_tx))
                 .await?;
 
-            for h in scheduler_handles {
-                if let Err(e) = h.await {
-                    error!(error = %e, "scheduler task join error");
-                }
+            if let Err(e) = watcher_handle.await {
+                error!(error = %e, "config watcher task join error");
+            }
+            if let Err(e) = scheduler_handle.await {
+                error!(error = %e, "scheduler task join error");
             }
         }
     }

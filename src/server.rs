@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -9,14 +7,14 @@ use chrono::Utc;
 use reqwest::Client;
 use serde_json::json;
 
-use crate::config::AppConfig;
+use crate::reload::ConfigHandle;
 use crate::render::{build_atom_feed, build_opml, build_rss_feed, escape_xml};
 use crate::runner::{run_feed, RunOutcome};
 use crate::store::Store;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<AppConfig>,
+    pub config: ConfigHandle,
     pub client: Client,
     pub store: Store,
 }
@@ -32,16 +30,18 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
-    let enabled = state.config.feeds.iter().filter(|f| f.enabled).count();
+    let config = state.config.current();
+    let enabled = config.feeds.iter().filter(|f| f.enabled).count();
     Json(json!({
         "status": "ok",
-        "feeds_total": state.config.feeds.len(),
+        "feeds_total": config.feeds.len(),
         "feeds_enabled": enabled,
     }))
 }
 
 async fn opml(State(state): State<AppState>) -> Response {
-    let xml = build_opml(&state.config.feeds, &state.config.server.base_url);
+    let config = state.config.current();
+    let xml = build_opml(&config.feeds, &config.server.base_url);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/x-opml; charset=utf-8")],
@@ -51,6 +51,7 @@ async fn opml(State(state): State<AppState>) -> Response {
 }
 
 async fn serve_feed(State(state): State<AppState>, Path(id_ext): Path<String>) -> Response {
+    let config = state.config.current();
     let (id, is_rss) = if let Some(stem) = id_ext.strip_suffix(".xml") {
         (stem, false)
     } else if let Some(stem) = id_ext.strip_suffix(".atom") {
@@ -61,11 +62,11 @@ async fn serve_feed(State(state): State<AppState>, Path(id_ext): Path<String>) -
         (id_ext.as_str(), false)
     };
 
-    let Ok(feed) = state.config.find_feed(id) else {
+    let Ok(feed) = config.find_feed(id) else {
         return (StatusCode::NOT_FOUND, format!("feed '{id}' not found")).into_response();
     };
 
-    let limit = feed.effective_max_items(&state.config.defaults);
+    let limit = feed.effective_max_items(&config.defaults);
     let entries = match state.store.list_entries(&feed.id, limit) {
         Ok(e) => e,
         Err(err) => {
@@ -73,7 +74,7 @@ async fn serve_feed(State(state): State<AppState>, Path(id_ext): Path<String>) -
         }
     };
 
-    let base_url = &state.config.server.base_url;
+    let base_url = &config.server.base_url;
     if is_rss {
         match build_rss_feed(feed, base_url, &entries) {
             Ok(xml) => (
@@ -102,7 +103,8 @@ async fn trigger_feed(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(expected) = state.config.server.trigger_token.as_deref() else {
+    let config = state.config.current();
+    let Some(expected) = config.server.trigger_token.as_deref() else {
         return (
             StatusCode::FORBIDDEN,
             Json(
@@ -125,7 +127,7 @@ async fn trigger_feed(
             .into_response();
     }
 
-    let Ok(feed) = state.config.find_feed(&id).cloned() else {
+    let Ok(feed) = config.find_feed(&id).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("feed '{id}' not found") })),
@@ -133,7 +135,7 @@ async fn trigger_feed(
             .into_response();
     };
 
-    match run_feed(&state.config, &feed, &state.client, &state.store, false).await {
+    match run_feed(&config, &feed, &state.client, &state.store, false).await {
         Ok(RunOutcome::Published(entry)) => (
             StatusCode::OK,
             Json(json!({ "status": "published", "entry_id": entry.id, "title": entry.title })),
@@ -154,8 +156,9 @@ async fn trigger_feed(
 }
 
 async fn dashboard(State(state): State<AppState>) -> Html<String> {
+    let config = state.config.current();
     let mut rows = String::new();
-    for feed in &state.config.feeds {
+    for feed in &config.feeds {
         let count = state.store.count_entries(&feed.id).unwrap_or(0);
         let last_run = state
             .store
@@ -174,7 +177,7 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
         let next_run = feed
             .parsed_schedule()
             .ok()
-            .zip(feed.effective_timezone(&state.config.defaults).ok())
+            .zip(feed.effective_timezone(&config.defaults).ok())
             .and_then(|(sched, tz)| {
                 let now = Utc::now().with_timezone(&tz);
                 sched
