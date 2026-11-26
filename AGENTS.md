@@ -8,17 +8,19 @@ Async Rust single-binary service that turns scheduled LLM prompts (with native p
 - `src/cli.rs` — `clap` CLI subcommands (`serve`, `run`, `validate`, `list`, `opml`).
 - `src/config.rs` — YAML config & `feeds/*.yaml` loader, `${VAR:-default}` env expansion, cron normalization (5/6/7 fields), and validation.
 - `src/error.rs` — Unified `AppError` enum (`thiserror`) and crate `Result<T>`.
-- `src/fetcher.rs` — Pre-fetchers for `type: url` (HTML-to-text + truncation) and `type: rss` (RSS 2.0 / Atom 1.0 parsing).
+- `src/fetcher.rs` — Pre-fetchers for `type: url` (HTML-to-text + truncation) and `type: rss` (RSS 2.0 / Atom 1.0 parsing with SQLite seen-item filtering and `fail_on_source_error` tolerance).
+- `src/http.rs` — Shared outbound HTTP retry/backoff helper (`429`/`408`/`5xx` + transient transport errors, honoring `Retry-After`).
 - `src/llm/` — Provider backends dispatched from `src/llm/mod.rs`:
   - `openai_responses.rs` (`/v1/responses` + `web_search` + `url_citation`)
   - `openai_compatible.rs` (`/v1/chat/completions` for Ollama, OpenRouter, Perplexity, LiteLLM)
   - `gemini.rs` (`:generateContent` + `google_search` + `groundingMetadata`)
   - `anthropic.rs` (`/v1/messages` + `web_search_20250305` + citations)
-- `src/render.rs` — Prompt template substitution, Markdown-to-HTML (`pulldown-cmark`), citation rendering, Atom 1.0, RSS 2.0, and OPML 2.0 builders.
-- `src/runner.rs` — End-to-end feed execution (`fetch -> prompt -> LLM -> skip/dedupe -> store -> record_run`).
-- `src/scheduler.rs` — Per-feed timezone-aware cron scheduler loops.
-- `src/server.rs` — Axum HTTP server (`/`, `/healthz`, `/opml.xml`, `/feeds/{id}.xml|.rss`, `POST /feeds/{id}/run`).
-- `src/store.rs` — SQLite persistence (`rusqlite` bundled, WAL mode) with retention pruning and run history.
+- `src/reload.rs` — `ConfigHandle` (`tokio::sync::watch`) hot-reload state, content-fingerprinting file watcher, and `SIGHUP` handler.
+- `src/render.rs` — `PromptContext` template substitution (`{{sources}}`, `{{previous_entry}}`, etc.), Markdown-to-HTML (`pulldown-cmark`), citation rendering, Atom 1.0, RSS 2.0, and OPML 2.0 builders.
+- `src/runner.rs` — End-to-end feed execution (`fetch -> prompt -> LLM -> skip/dedupe -> store -> mark_seen -> record_run`) plus `RunTracker` per-feed concurrency guard.
+- `src/scheduler.rs` — Dynamic supervisor managing per-feed timezone-aware cron loops that reconcile on config hot-reload.
+- `src/server.rs` — Axum HTTP server (`/`, `/healthz`, `/opml.xml`, `/feeds/{id}.xml|.rss`, `POST /feeds/{id}/run`, `POST /reload`) with interactive dashboard controls.
+- `src/store.rs` — SQLite persistence (`rusqlite` bundled, WAL mode) with idempotent schema migrations, `entries` (including `raw_markdown`), `runs`, and `seen_source_items`.
 - `tests/integration.rs` — Loopback HTTP integration tests with mock upstream RSS and LLM endpoints.
 
 ## Common Commands

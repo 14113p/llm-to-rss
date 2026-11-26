@@ -2,8 +2,11 @@ server:
   bind: "0.0.0.0:8080"
   # Public or internal URL clients/RSS readers use to reach this service (e.g. http://llm-to-rss:8080 in Docker)
   base_url: "${LLM_TO_RSS_BASE_URL:-http://localhost:8080}"
-  # Optional bearer token for POST /feeds/{id}/run manual triggers
+  # Optional bearer token protecting POST /feeds/{id}/run and POST /reload.
+  # If unset, manual triggers (including dashboard "Run now") work without auth (intended for LANs).
   # trigger_token: "${LLM_TO_RSS_TRIGGER_TOKEN}"
+  # Seconds between hot-reload checks on config.yaml and feeds_dir (0 disables polling; SIGHUP still works)
+  reload_interval_secs: 2
 
 storage:
   db_path: "data/llm-to-rss.db"
@@ -12,6 +15,9 @@ defaults:
   timezone: "${TZ:-Europe/Berlin}"
   max_items: 50
   timeout_secs: 90
+  max_retries: 3
+  retry_base_delay_ms: 1000
+  fail_on_source_error: true
 
 # Drop one *.yaml file per virtual feed into this directory
 feeds_dir: "feeds"
