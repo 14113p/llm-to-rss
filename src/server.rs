@@ -4,21 +4,14 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use reqwest::Client;
 use serde_json::json;
 
-use crate::reload::ConfigHandle;
+use crate::error::AppError;
 use crate::render::{build_atom_feed, build_opml, build_rss_feed, escape_xml};
-use crate::runner::{run_feed, RunOutcome, RunTracker};
+use crate::runner::{AppContext, RunOutcome};
 use crate::store::Store;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub config: ConfigHandle,
-    pub client: Client,
-    pub store: Store,
-    pub runs: RunTracker,
-}
+pub type AppState = AppContext;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -173,33 +166,36 @@ async fn trigger_feed(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let config = state.config.current();
+    let config = state.current_config();
     if !is_trigger_authorized(config.server.trigger_token.as_deref(), &headers) {
         return unauthorized_response();
     }
 
-    let Ok(feed) = config.find_feed(&id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("feed '{id}' not found") })),
-        )
-            .into_response();
+    let guarded = state.run_feed_guarded(&id, false).await;
+    let outcome = match guarded {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "running",
+                    "error": format!("feed '{id}' is already running"),
+                })),
+            )
+                .into_response();
+        }
+        Err(AppError::FeedNotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("feed '{id}' not found") })),
+            )
+                .into_response();
+        }
+        Err(err) => Err(err),
     };
 
-    let Some(_permit) = state.runs.try_acquire(&feed.id) else {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "status": "running",
-                "error": format!("feed '{id}' is already running"),
-            })),
-        )
-            .into_response();
-    };
-
-    let outcome = run_feed(&config, &feed, &state.client, &state.store, false).await;
-    let items = state.store.count_entries(&feed.id).unwrap_or(0);
-    let (last_run, last_run_detail) = format_last_run(&state.store, &feed.id);
+    let items = state.store.count_entries(&id).unwrap_or(0);
+    let (last_run, last_run_detail) = format_last_run(&state.store, &id);
 
     match outcome {
         Ok(RunOutcome::Published(entry)) => (

@@ -12,10 +12,52 @@ use crate::config::{AppConfig, FeedConfig};
 use crate::error::{AppError, Result};
 use crate::fetcher::{fetch_sources, FetchOptions};
 use crate::llm::{self, LlmRequest};
+use crate::reload::ConfigHandle;
 use crate::render::{render_entry_html, render_prompt, PromptContext};
 use crate::store::{FeedEntry, Store};
 
 const MAX_SEEN_ITEMS_PER_SOURCE: usize = 2_000;
+
+/// Shared runtime context bundling hot-reloadable config, HTTP client, SQLite store, and run locks.
+#[derive(Clone)]
+pub struct AppContext {
+    pub config: ConfigHandle,
+    pub client: Client,
+    pub store: Store,
+    pub runs: RunTracker,
+}
+
+impl AppContext {
+    pub fn new(config: ConfigHandle, client: Client, store: Store) -> Self {
+        Self {
+            config,
+            client,
+            store,
+            runs: RunTracker::new(),
+        }
+    }
+
+    pub fn current_config(&self) -> Arc<AppConfig> {
+        self.config.current()
+    }
+
+    /// Look up `feed_id` in the active config and run it under the per-feed concurrency guard.
+    /// Returns `Ok(None)` if a run for this feed is already in progress.
+    pub async fn run_feed_guarded(
+        &self,
+        feed_id: &str,
+        dry_run: bool,
+    ) -> Result<Option<RunOutcome>> {
+        let cfg = self.config.current();
+        let feed = cfg.find_feed(feed_id)?.clone();
+        let Some(_permit) = self.runs.try_acquire(&feed.id) else {
+            return Ok(None);
+        };
+        run_feed(&cfg, &feed, &self.client, &self.store, dry_run)
+            .await
+            .map(Some)
+    }
+}
 
 /// Tracks currently executing feeds so manual triggers and scheduled runs do not overlap.
 #[derive(Clone, Default)]

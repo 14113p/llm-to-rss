@@ -14,9 +14,9 @@ use llm_to_rss::cli::{Cli, Command};
 use llm_to_rss::config::AppConfig;
 use llm_to_rss::reload::{spawn_config_watcher, ConfigHandle};
 use llm_to_rss::render::build_opml;
-use llm_to_rss::runner::{run_all_feeds, run_feed, RunOutcome, RunTracker};
+use llm_to_rss::runner::{run_all_feeds, run_feed, AppContext, RunOutcome};
 use llm_to_rss::scheduler::spawn_scheduler;
-use llm_to_rss::server::{router, AppState};
+use llm_to_rss::server::router;
 use llm_to_rss::store::Store;
 
 #[tokio::main]
@@ -89,30 +89,17 @@ async fn main() -> anyhow::Result<()> {
             let store = Store::open(&config.storage.db_path)?;
 
             let config_handle = ConfigHandle::new(Arc::clone(&config), cli.config.clone());
-            let runs = RunTracker::new();
+            let ctx = AppContext::new(config_handle.clone(), client, store);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-            let scheduler_handle = spawn_scheduler(
-                config_handle.clone(),
-                client.clone(),
-                store.clone(),
-                runs.clone(),
-                shutdown_rx.clone(),
-            );
+            let scheduler_handle = spawn_scheduler(ctx.clone(), shutdown_rx.clone());
             let watcher_handle = spawn_config_watcher(
-                config_handle.clone(),
+                config_handle,
                 Duration::from_secs(config.server.reload_interval_secs),
                 shutdown_rx,
             );
 
-            let state = AppState {
-                config: config_handle,
-                client,
-                store,
-                runs,
-            };
-
-            let app = router(state);
+            let app = router(ctx);
             let listener = TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("failed to bind {}", config.server.bind))?;

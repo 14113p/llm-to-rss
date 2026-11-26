@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use reqwest::Client;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::reload::ConfigHandle;
-use crate::runner::{run_feed, RunTracker};
-use crate::store::Store;
+use crate::runner::AppContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScheduleKey {
@@ -24,18 +21,12 @@ struct ActiveFeedTask {
 
 /// Spawn a supervisor task that maintains per-feed cron scheduler loops and dynamically
 /// reconciles them whenever the configuration is hot-reloaded.
-pub fn spawn_scheduler(
-    config: ConfigHandle,
-    client: Client,
-    store: Store,
-    runs: RunTracker,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+pub fn spawn_scheduler(ctx: AppContext, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut config_rx = config.subscribe();
+        let mut config_rx = ctx.config.subscribe();
         let mut active: HashMap<String, ActiveFeedTask> = HashMap::new();
 
-        reconcile_feeds(&mut active, &config, &client, &store, &runs, true).await;
+        reconcile_feeds(&mut active, &ctx, true).await;
 
         loop {
             if *shutdown.borrow() {
@@ -47,7 +38,7 @@ pub fn spawn_scheduler(
                     if changed.is_err() {
                         break;
                     }
-                    reconcile_feeds(&mut active, &config, &client, &store, &runs, false).await;
+                    reconcile_feeds(&mut active, &ctx, false).await;
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -68,13 +59,10 @@ pub fn spawn_scheduler(
 
 async fn reconcile_feeds(
     active: &mut HashMap<String, ActiveFeedTask>,
-    config_handle: &ConfigHandle,
-    client: &Client,
-    store: &Store,
-    runs: &RunTracker,
+    ctx: &AppContext,
     is_initial_startup: bool,
 ) {
-    let cfg = config_handle.current();
+    let cfg = ctx.current_config();
     let mut desired: HashMap<String, (ScheduleKey, bool)> = HashMap::new();
 
     for feed in cfg.feeds.iter().filter(|f| f.enabled) {
@@ -123,10 +111,7 @@ async fn reconcile_feeds(
         let (stop_tx, stop_rx) = watch::channel(false);
         let handle = tokio::spawn(run_feed_loop(
             id.clone(),
-            config_handle.clone(),
-            client.clone(),
-            store.clone(),
-            runs.clone(),
+            ctx.clone(),
             stop_rx,
             is_initial_startup && run_on_startup,
         ));
@@ -143,14 +128,11 @@ async fn reconcile_feeds(
 
 async fn run_feed_loop(
     feed_id: String,
-    config_handle: ConfigHandle,
-    client: Client,
-    store: Store,
-    runs: RunTracker,
+    ctx: AppContext,
     mut stop: watch::Receiver<bool>,
     run_on_startup: bool,
 ) {
-    let initial_cfg = config_handle.current();
+    let initial_cfg = ctx.current_config();
     let Ok(initial_feed) = initial_cfg.find_feed(&feed_id).cloned() else {
         return;
     };
@@ -171,7 +153,7 @@ async fn run_feed_loop(
 
     if run_on_startup {
         info!(feed_id = %feed_id, "running feed on startup");
-        execute_if_idle(&feed_id, &config_handle, &client, &store, &runs, "startup").await;
+        execute_if_idle(&ctx, &feed_id, "startup").await;
     }
 
     loop {
@@ -194,7 +176,7 @@ async fn run_feed_loop(
 
         tokio::select! {
             _ = tokio::time::sleep(wait_std) => {
-                execute_if_idle(&feed_id, &config_handle, &client, &store, &runs, "scheduled").await;
+                execute_if_idle(&ctx, &feed_id, "scheduled").await;
             }
             _ = stop.changed() => {
                 if *stop.borrow() {
@@ -205,25 +187,19 @@ async fn run_feed_loop(
     }
 }
 
-async fn execute_if_idle(
-    feed_id: &str,
-    config_handle: &ConfigHandle,
-    client: &Client,
-    store: &Store,
-    runs: &RunTracker,
-    kind: &str,
-) {
-    let Some(_permit) = runs.try_acquire(feed_id) else {
-        info!(feed_id = %feed_id, trigger = kind, "skipping run because feed is already running");
+async fn execute_if_idle(ctx: &AppContext, feed_id: &str, kind: &str) {
+    let cfg = ctx.current_config();
+    if cfg.find_feed(feed_id).is_ok_and(|f| !f.enabled) {
         return;
-    };
+    }
 
-    let cfg = config_handle.current();
-    if let Ok(feed) = cfg.find_feed(feed_id) {
-        if feed.enabled {
-            if let Err(e) = run_feed(&cfg, feed, client, store, false).await {
-                error!(feed_id = %feed_id, trigger = kind, error = %e, "feed run failed");
-            }
+    match ctx.run_feed_guarded(feed_id, false).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            info!(feed_id = %feed_id, trigger = kind, "skipping run because feed is already running");
+        }
+        Err(e) => {
+            error!(feed_id = %feed_id, trigger = kind, error = %e, "feed run failed");
         }
     }
 }
