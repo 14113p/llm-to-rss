@@ -114,6 +114,8 @@ Available inside `prompt`:
 - `{{datetime}}` — current RFC 3339 timestamp in the feed's timezone
 - `{{feed_title}}` / `{{feed_id}}` — metadata from the feed YAML
 - `{{sources}}` — formatted output of pre-fetched `sources` (if omitted when `sources` are configured, appended automatically)
+- `{{previous_entry}}` — last stored entry's timestamp, title, and Markdown body (useful for delta tracking in price watches and monitors)
+- `{{previous_entry_date}}` — local date (`YYYY-MM-DD`) of the last stored entry, or `none` on the first run
 
 Available inside `entry_title_template`:
 - `{{date}}`, `{{datetime}}`, `{{feed_title}}`, `{{headline}}` (first `# ...` line extracted from the LLM output)

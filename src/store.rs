@@ -20,6 +20,8 @@ pub struct FeedEntry {
     pub title: String,
     pub link: String,
     pub content_html: String,
+    #[serde(default)]
+    pub raw_markdown: Option<String>,
     pub summary: String,
     pub published_at: DateTime<Utc>,
     pub content_hash: String,
@@ -59,6 +61,7 @@ impl Store {
                 title TEXT NOT NULL,
                 link TEXT NOT NULL,
                 content_html TEXT NOT NULL,
+                raw_markdown TEXT,
                 summary TEXT NOT NULL,
                 published_at TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
@@ -80,6 +83,7 @@ impl Store {
                 ON runs (feed_id, finished_at DESC);
             ",
         )?;
+        ensure_column(&conn, "entries", "raw_markdown", "TEXT")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -91,14 +95,15 @@ impl Store {
             .map_err(|e| crate::error::AppError::Serde(e.to_string()))?;
 
         conn.execute(
-            "INSERT INTO entries (id, feed_id, title, link, content_html, summary, published_at, content_hash, model, citations_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO entries (id, feed_id, title, link, content_html, raw_markdown, summary, published_at, content_hash, model, citations_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.id,
                 entry.feed_id,
                 entry.title,
                 entry.link,
                 entry.content_html,
+                entry.raw_markdown,
                 entry.summary,
                 entry.published_at.to_rfc3339(),
                 entry.content_hash,
@@ -134,37 +139,33 @@ impl Store {
         Ok(hash)
     }
 
+    pub fn latest_entry(&self, feed_id: &str) -> Result<Option<FeedEntry>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let entry = conn
+            .query_row(
+                "SELECT id, feed_id, title, link, content_html, raw_markdown, summary, published_at, content_hash, model, citations_json
+                 FROM entries
+                 WHERE feed_id = ?1
+                 ORDER BY published_at DESC
+                 LIMIT 1",
+                params![feed_id],
+                entry_from_row,
+            )
+            .optional()?;
+        Ok(entry)
+    }
+
     pub fn list_entries(&self, feed_id: &str, limit: usize) -> Result<Vec<FeedEntry>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, feed_id, title, link, content_html, summary, published_at, content_hash, model, citations_json
+            "SELECT id, feed_id, title, link, content_html, raw_markdown, summary, published_at, content_hash, model, citations_json
              FROM entries
              WHERE feed_id = ?1
              ORDER BY published_at DESC
              LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![feed_id, limit as i64], |row| {
-            let published_raw: String = row.get(6)?;
-            let citations_raw: String = row.get(9)?;
-            let published_at = DateTime::parse_from_rfc3339(&published_raw)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let citations: Vec<Citation> = serde_json::from_str(&citations_raw).unwrap_or_default();
-
-            Ok(FeedEntry {
-                id: row.get(0)?,
-                feed_id: row.get(1)?,
-                title: row.get(2)?,
-                link: row.get(3)?,
-                content_html: row.get(4)?,
-                summary: row.get(5)?,
-                published_at,
-                content_hash: row.get(7)?,
-                model: row.get(8)?,
-                citations,
-            })
-        })?;
+        let rows = stmt.query_map(params![feed_id, limit as i64], entry_from_row)?;
 
         let mut out = Vec::new();
         for row in rows {
@@ -235,6 +236,43 @@ impl Store {
     }
 }
 
+fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedEntry> {
+    let published_raw: String = row.get(7)?;
+    let citations_raw: String = row.get(10)?;
+    let published_at = DateTime::parse_from_rfc3339(&published_raw)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let citations: Vec<Citation> = serde_json::from_str(&citations_raw).unwrap_or_default();
+
+    Ok(FeedEntry {
+        id: row.get(0)?,
+        feed_id: row.get(1)?,
+        title: row.get(2)?,
+        link: row.get(3)?,
+        content_html: row.get(4)?,
+        raw_markdown: row.get(5)?,
+        summary: row.get(6)?,
+        published_at,
+        content_hash: row.get(8)?,
+        model: row.get(9)?,
+        citations,
+    })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !existing.iter().any(|c| c == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +290,7 @@ mod tests {
                 title: format!("Item {i}"),
                 link: "http://localhost:8080/feeds/briefing.xml".into(),
                 content_html: format!("<p>{i}</p>"),
+                raw_markdown: Some(format!("# Item {i}\n\nBody {i}")),
                 summary: format!("summary {i}"),
                 published_at: Utc::now() + chrono::Duration::seconds(i),
                 content_hash: format!("hash-{i}"),
@@ -268,6 +307,9 @@ mod tests {
             store.latest_content_hash("briefing").unwrap().as_deref(),
             Some("hash-4")
         );
+        let latest = store.latest_entry("briefing").unwrap().unwrap();
+        assert_eq!(latest.title, "Item 4");
+        assert_eq!(latest.raw_markdown.as_deref(), Some("# Item 4\n\nBody 4"));
 
         let now = Utc::now();
         store
@@ -275,5 +317,40 @@ mod tests {
             .unwrap();
         let last = store.last_run("briefing").unwrap().unwrap();
         assert_eq!(last.status, "ok");
+    }
+
+    #[test]
+    fn migrates_legacy_entries_table_without_raw_markdown() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (
+                    id TEXT PRIMARY KEY,
+                    feed_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    link TEXT NOT NULL,
+                    content_html TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    citations_json TEXT NOT NULL
+                );
+                INSERT INTO entries VALUES (
+                    'urn:uuid:old', 'deals', 'Old Deal', 'http://localhost/feeds/deals.xml',
+                    '<p>PS5: 2200 PLN</p>', 'PS5: 2200 PLN', '2026-11-25T07:00:00Z',
+                    'oldhash', 'gpt-4o', '[]'
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap();
+        let latest = store.latest_entry("deals").unwrap().unwrap();
+        assert_eq!(latest.title, "Old Deal");
+        assert_eq!(latest.raw_markdown, None);
+        assert_eq!(latest.content_html, "<p>PS5: 2200 PLN</p>");
     }
 }

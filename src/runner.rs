@@ -10,7 +10,7 @@ use crate::config::{AppConfig, FeedConfig};
 use crate::error::{AppError, Result};
 use crate::fetcher::fetch_sources;
 use crate::llm::{self, LlmRequest};
-use crate::render::{render_entry_html, render_prompt};
+use crate::render::{render_entry_html, render_prompt, PromptContext};
 use crate::store::{FeedEntry, Store};
 
 #[derive(Debug, Clone)]
@@ -88,7 +88,19 @@ async fn run_feed_inner(
     info!(feed_id = %feed.id, provider = %feed.provider, "running virtual feed");
 
     let sources = fetch_sources(client, &feed.sources).await?;
-    let user_prompt = render_prompt(feed, now_local, &sources);
+    let previous_entry = if feed.prompt.contains("{{previous_entry") {
+        store.latest_entry(&feed.id)?
+    } else {
+        None
+    };
+    let user_prompt = render_prompt(
+        feed,
+        &PromptContext {
+            now_local,
+            sources: &sources,
+            previous_entry: previous_entry.as_ref(),
+        },
+    );
 
     let default_system = "You are generating an item for a personal RSS/Atom feed reader. \
         Write crisp, scannable Markdown. Start with a concise `# Headline` on the first line, \
@@ -155,6 +167,7 @@ async fn run_feed_inner(
         title,
         link,
         content_html,
+        raw_markdown: Some(normalized.to_string()),
         summary,
         published_at: Utc::now(),
         content_hash,

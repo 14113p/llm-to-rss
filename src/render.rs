@@ -6,27 +6,44 @@ use pulldown_cmark::{html, Options, Parser};
 
 use crate::config::FeedConfig;
 use crate::error::{AppError, Result};
-use crate::fetcher::FetchedSource;
+use crate::fetcher::{html_to_text, truncate_chars, FetchedSource};
 use crate::store::{Citation, FeedEntry};
 
-/// Render a feed prompt by substituting template variables and attaching pre-fetched sources.
-pub fn render_prompt(
-    feed: &FeedConfig,
-    now_local: DateTime<Tz>,
-    sources: &[FetchedSource],
-) -> String {
-    let date_str = now_local.format("%Y-%m-%d").to_string();
-    let datetime_str = now_local.to_rfc3339();
+const PREVIOUS_ENTRY_MAX_CHARS: usize = 8_000;
 
-    let sources_block = if sources.is_empty() {
+/// Context values available when rendering a feed's prompt template.
+pub struct PromptContext<'a> {
+    pub now_local: DateTime<Tz>,
+    pub sources: &'a [FetchedSource],
+    pub previous_entry: Option<&'a FeedEntry>,
+}
+
+/// Render a feed prompt by substituting template variables and attaching pre-fetched sources.
+pub fn render_prompt(feed: &FeedConfig, ctx: &PromptContext<'_>) -> String {
+    let date_str = ctx.now_local.format("%Y-%m-%d").to_string();
+    let datetime_str = ctx.now_local.to_rfc3339();
+    let tz = ctx.now_local.timezone();
+
+    let sources_block = if ctx.sources.is_empty() {
         String::new()
     } else {
-        sources
+        ctx.sources
             .iter()
             .map(|s| format!("### {} ({})\n{}", s.name, s.url, s.content))
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+
+    let previous_entry_block = format_previous_entry(ctx.previous_entry, tz);
+    let previous_entry_date = ctx
+        .previous_entry
+        .map(|e| {
+            e.published_at
+                .with_timezone(&tz)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "none".to_string());
 
     let has_sources_placeholder = feed.prompt.contains("{{sources}}");
     let mut rendered = feed
@@ -35,14 +52,41 @@ pub fn render_prompt(
         .replace("{{datetime}}", &datetime_str)
         .replace("{{feed_title}}", &feed.title)
         .replace("{{feed_id}}", &feed.id)
-        .replace("{{sources}}", &sources_block);
+        .replace("{{sources}}", &sources_block)
+        .replace("{{previous_entry}}", &previous_entry_block)
+        .replace("{{previous_entry_date}}", &previous_entry_date);
 
-    if !sources.is_empty() && !has_sources_placeholder {
+    if !ctx.sources.is_empty() && !has_sources_placeholder {
         rendered.push_str("\n\n---\n## Pre-fetched Sources\n\n");
         rendered.push_str(&sources_block);
     }
 
     rendered
+}
+
+fn format_previous_entry(entry: Option<&FeedEntry>, tz: Tz) -> String {
+    let Some(entry) = entry else {
+        return "(No previous entry yet.)".to_string();
+    };
+
+    let published_local = entry
+        .published_at
+        .with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M %Z");
+
+    let raw_body = entry
+        .raw_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| html_to_text(&entry.content_html));
+
+    let body = truncate_chars(&raw_body, PREVIOUS_ENTRY_MAX_CHARS);
+    format!(
+        "Previous entry ({published_local}): {}\n\n{body}",
+        entry.title
+    )
 }
 
 /// Extract an optional leading `# Headline` from the LLM markdown, resolve the entry title,
@@ -342,6 +386,7 @@ mod tests {
             title: "Test Entry".into(),
             link: "http://localhost:8080/feeds/morning.xml".into(),
             content_html: "<p>Hello</p>".into(),
+            raw_markdown: Some("# Test Entry\n\nHello".into()),
             summary: "Hello".into(),
             published_at: Utc::now(),
             content_hash: "abc".into(),
@@ -358,5 +403,62 @@ mod tests {
 
         let opml = build_opml(&[feed], "http://localhost:8080");
         assert!(opml.contains("xmlUrl=\"http://localhost:8080/feeds/morning.xml\""));
+    }
+
+    #[test]
+    fn renders_previous_entry_placeholder_with_markdown_and_fallback() {
+        let mut feed = sample_feed();
+        feed.prompt = "Compare with previous ({{previous_entry_date}}):\n{{previous_entry}}".into();
+        let tz: Tz = "UTC".parse().unwrap();
+        let now = Utc::now().with_timezone(&tz);
+
+        let first = render_prompt(
+            &feed,
+            &PromptContext {
+                now_local: now,
+                sources: &[],
+                previous_entry: None,
+            },
+        );
+        assert!(first.contains("(No previous entry yet.)"));
+        assert!(first.contains("(none)"));
+
+        let prev_md = FeedEntry {
+            id: "urn:uuid:1".into(),
+            feed_id: "morning".into(),
+            title: "PS5 at 2200 PLN".into(),
+            link: "http://localhost:8080/feeds/morning.xml".into(),
+            content_html: "<p>HTML fallback</p>".into(),
+            raw_markdown: Some("# PS5 at 2200 PLN\n\n- Media Expert: 2200 PLN".into()),
+            summary: "PS5".into(),
+            published_at: DateTime::parse_from_rfc3339("2026-11-25T08:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            content_hash: "abc".into(),
+            model: "gpt-4o".into(),
+            citations: vec![],
+        };
+        let second = render_prompt(
+            &feed,
+            &PromptContext {
+                now_local: now,
+                sources: &[],
+                previous_entry: Some(&prev_md),
+            },
+        );
+        assert!(second.contains("2026-11-25"));
+        assert!(second.contains("Media Expert: 2200 PLN"));
+
+        let mut legacy = prev_md;
+        legacy.raw_markdown = None;
+        let third = render_prompt(
+            &feed,
+            &PromptContext {
+                now_local: now,
+                sources: &[],
+                previous_entry: Some(&legacy),
+            },
+        );
+        assert!(third.contains("HTML fallback"));
     }
 }

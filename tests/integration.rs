@@ -259,3 +259,113 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
         .unwrap();
     assert_eq!(auth.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn passes_previous_entry_into_subsequent_prompt() {
+    let seen_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let prompts_clone = Arc::clone(&seen_prompts);
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_clone = Arc::clone(&call_count);
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let prompts = Arc::clone(&prompts_clone);
+            let counter = Arc::clone(&count_clone);
+            async move {
+                let user_msg = body["messages"]
+                    .as_array()
+                    .and_then(|arr| arr.iter().find(|m| m["role"] == "user"))
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                prompts.lock().unwrap().push(user_msg);
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = if n == 0 {
+                    "# PS5 Watch\n\nLowest price: 2100 PLN at Media Expert."
+                } else {
+                    "# PS5 Watch\n\nLowest price: 1900 PLN (down 200 PLN since last run)."
+                };
+                Json(json!({
+                    "model": "llama3.2",
+                    "choices": [{ "message": { "content": reply } }]
+                }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "local".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenaiCompatible,
+            model: "llama3.2".to_string(),
+            api_key: None,
+            base_url: Some(format!("http://{addr}/v1")),
+            web_search: false,
+            temperature: None,
+            max_tokens: None,
+            extra_headers: BTreeMap::new(),
+        },
+    );
+
+    let feed = FeedConfig {
+        id: "price-delta".to_string(),
+        title: "Price Delta".to_string(),
+        description: None,
+        category: None,
+        enabled: true,
+        schedule: "0 8 * * *".to_string(),
+        timezone: Some("UTC".to_string()),
+        provider: "local".to_string(),
+        model: None,
+        web_search: None,
+        system_prompt: None,
+        prompt: "Check price.\n\nPrevious:\n{{previous_entry}}".to_string(),
+        entry_title_template: None,
+        sources: vec![],
+        skip_if_contains: None,
+        deduplicate: false,
+        max_items: Some(10),
+        run_on_startup: false,
+    };
+
+    let config = AppConfig {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            db_path: dir.path().join("delta.db"),
+        },
+        defaults: DefaultsConfig::default(),
+        feeds_dir: None,
+        providers,
+        feeds: vec![feed.clone()],
+    };
+
+    let client = Client::builder().no_proxy().build().unwrap();
+    let store = Store::open(&config.storage.db_path).unwrap();
+
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, false)
+            .await
+            .unwrap(),
+        RunOutcome::Published(_)
+    ));
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, false)
+            .await
+            .unwrap(),
+        RunOutcome::Published(_)
+    ));
+
+    let prompts = seen_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("(No previous entry yet.)"));
+    assert!(prompts[1].contains("Lowest price: 2100 PLN at Media Expert."));
+}
