@@ -3,6 +3,14 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
+
+# Pre-compile crate dependencies in a separate cached layer so code-only edits rebuild quickly.
+RUN mkdir -p src \
+    && printf 'pub fn _dummy() {}\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && (cargo build --release --locked 2>/dev/null || cargo build --release) \
+    && rm -rf src target/release/llm-to-rss target/release/deps/llm_to_rss* target/release/deps/libllm_to_rss* target/release/.fingerprint/llm-to-rss-*
+
 COPY src ./src
 COPY tests ./tests
 
