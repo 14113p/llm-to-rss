@@ -153,6 +153,9 @@ pub struct FeedConfig {
     pub sources: Vec<SourceConfig>,
     #[serde(default)]
     pub skip_if_contains: Option<String>,
+    /// Skip calling the LLM when all `only_new: true` RSS sources have zero unseen items.
+    #[serde(default)]
+    pub skip_if_no_new_items: bool,
     #[serde(default)]
     pub deduplicate: bool,
     #[serde(default)]
@@ -202,6 +205,9 @@ pub enum SourceConfig {
         url: String,
         #[serde(default)]
         limit: Option<usize>,
+        /// Filter out RSS/Atom items already seen in previous successful runs (default: true).
+        #[serde(default = "default_true")]
+        only_new: bool,
     },
 }
 

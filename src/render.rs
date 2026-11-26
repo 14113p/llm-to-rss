@@ -351,6 +351,7 @@ mod tests {
             entry_title_template: None,
             sources: vec![],
             skip_if_contains: None,
+            skip_if_no_new_items: false,
             deduplicate: false,
             max_items: None,
             run_on_startup: false,

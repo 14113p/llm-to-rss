@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,12 @@ pub struct FeedEntry {
     pub content_hash: String,
     pub model: String,
     pub citations: Vec<Citation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenSourceItem {
+    pub source_url: String,
+    pub item_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +88,16 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_runs_feed_finished
                 ON runs (feed_id, finished_at DESC);
+
+            CREATE TABLE IF NOT EXISTS seen_source_items (
+                feed_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (feed_id, source_url, item_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_seen_source_items_feed_source_time
+                ON seen_source_items (feed_id, source_url, seen_at DESC);
             ",
         )?;
         ensure_column(&conn, "entries", "raw_markdown", "TEXT")?;
@@ -234,6 +251,65 @@ impl Store {
             .optional()?;
         Ok(run)
     }
+
+    pub fn seen_item_keys(&self, feed_id: &str, source_url: &str) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT item_key FROM seen_source_items WHERE feed_id = ?1 AND source_url = ?2",
+        )?;
+        let rows = stmt.query_map(params![feed_id, source_url], |row| row.get::<_, String>(0))?;
+        let mut keys = HashSet::new();
+        for row in rows {
+            keys.insert(row?);
+        }
+        Ok(keys)
+    }
+
+    pub fn mark_source_items_seen(
+        &self,
+        feed_id: &str,
+        items: &[SeenSourceItem],
+        max_per_source: usize,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mut touched_sources = HashSet::new();
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO seen_source_items (feed_id, source_url, item_key, seen_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for item in items {
+                stmt.execute(params![feed_id, item.source_url, item.item_key, now])?;
+                touched_sources.insert(item.source_url.as_str());
+            }
+        }
+
+        if max_per_source > 0 {
+            let mut prune = tx.prepare(
+                "DELETE FROM seen_source_items
+                 WHERE feed_id = ?1
+                   AND source_url = ?2
+                   AND item_key NOT IN (
+                       SELECT item_key FROM seen_source_items
+                       WHERE feed_id = ?1 AND source_url = ?2
+                       ORDER BY seen_at DESC, rowid DESC
+                       LIMIT ?3
+                   )",
+            )?;
+            for source_url in touched_sources {
+                prune.execute(params![feed_id, source_url, max_per_source as i64])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedEntry> {
@@ -352,5 +428,31 @@ mod tests {
         assert_eq!(latest.title, "Old Deal");
         assert_eq!(latest.raw_markdown, None);
         assert_eq!(latest.content_html, "<p>PS5: 2200 PLN</p>");
+    }
+
+    #[test]
+    fn tracks_and_prunes_seen_source_items() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("seen.db")).unwrap();
+
+        let items: Vec<SeenSourceItem> = (0..5)
+            .map(|i| SeenSourceItem {
+                source_url: "https://example.com/rss".into(),
+                item_key: format!("guid-{i}"),
+            })
+            .collect();
+        store.mark_source_items_seen("briefing", &items, 3).unwrap();
+
+        let keys = store
+            .seen_item_keys("briefing", "https://example.com/rss")
+            .unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains("guid-4"));
+        assert!(keys.contains("guid-3"));
+        assert!(keys.contains("guid-2"));
+        assert!(store
+            .seen_item_keys("other-feed", "https://example.com/rss")
+            .unwrap()
+            .is_empty());
     }
 }

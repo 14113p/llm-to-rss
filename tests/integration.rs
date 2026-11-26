@@ -133,8 +133,10 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
             name: "Mock Tech".to_string(),
             url: format!("{mock_base}/source.rss"),
             limit: Some(5),
+            only_new: false,
         }],
         skip_if_contains: None,
+        skip_if_no_new_items: false,
         deduplicate: true,
         max_items: Some(10),
         run_on_startup: false,
@@ -156,6 +158,7 @@ async fn end_to_end_fetch_llm_store_and_http_serve() {
         entry_title_template: None,
         sources: vec![],
         skip_if_contains: Some("NO_UPDATE".to_string()),
+        skip_if_no_new_items: false,
         deduplicate: false,
         max_items: None,
         run_on_startup: false,
@@ -332,6 +335,7 @@ async fn passes_previous_entry_into_subsequent_prompt() {
         entry_title_template: None,
         sources: vec![],
         skip_if_contains: None,
+        skip_if_no_new_items: false,
         deduplicate: false,
         max_items: Some(10),
         run_on_startup: false,
@@ -368,4 +372,165 @@ async fn passes_previous_entry_into_subsequent_prompt() {
     assert_eq!(prompts.len(), 2);
     assert!(prompts[0].contains("(No previous entry yet.)"));
     assert!(prompts[1].contains("Lowest price: 2100 PLN at Media Expert."));
+}
+
+#[tokio::test]
+async fn tracks_seen_rss_items_across_runs() {
+    let rss_items = Arc::new(std::sync::Mutex::new(vec![(
+        "guid-a".to_string(),
+        "Article A".to_string(),
+    )]));
+    let rss_items_clone = Arc::clone(&rss_items);
+
+    let seen_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let prompts_clone = Arc::clone(&seen_prompts);
+
+    let app = Router::new()
+        .route(
+            "/dynamic.rss",
+            get(move || {
+                let items = rss_items_clone.lock().unwrap().clone();
+                async move {
+                    let mut body = String::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Dyn</title><link>https://example.com</link><description>d</description>"#,
+                    );
+                    for (guid, title) in items {
+                        body.push_str(&format!(
+                            "<item><guid>{guid}</guid><title>{title}</title><link>https://example.com/{guid}</link></item>"
+                        ));
+                    }
+                    body.push_str("</channel></rss>");
+                    body
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let prompts = Arc::clone(&prompts_clone);
+                async move {
+                    let user_msg = body["messages"]
+                        .as_array()
+                        .and_then(|arr| arr.iter().find(|m| m["role"] == "user"))
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let n = {
+                        let mut p = prompts.lock().unwrap();
+                        p.push(user_msg);
+                        p.len()
+                    };
+                    Json(json!({
+                        "model": "llama3.2",
+                        "choices": [{ "message": { "content": format!("# Digest {n}\n\nSummary {n}") } }]
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "local".to_string(),
+        ProviderConfig {
+            kind: ProviderKind::OpenaiCompatible,
+            model: "llama3.2".to_string(),
+            api_key: None,
+            base_url: Some(format!("http://{addr}/v1")),
+            web_search: false,
+            temperature: None,
+            max_tokens: None,
+            extra_headers: BTreeMap::new(),
+        },
+    );
+
+    let feed = FeedConfig {
+        id: "rss-seen".to_string(),
+        title: "RSS Seen Test".to_string(),
+        description: None,
+        category: None,
+        enabled: true,
+        schedule: "0 8 * * *".to_string(),
+        timezone: Some("UTC".to_string()),
+        provider: "local".to_string(),
+        model: None,
+        web_search: None,
+        system_prompt: None,
+        prompt: "Summarize:\n{{sources}}".to_string(),
+        entry_title_template: None,
+        sources: vec![SourceConfig::Rss {
+            name: "Dyn".to_string(),
+            url: format!("http://{addr}/dynamic.rss"),
+            limit: Some(10),
+            only_new: true,
+        }],
+        skip_if_contains: None,
+        skip_if_no_new_items: true,
+        deduplicate: false,
+        max_items: Some(10),
+        run_on_startup: false,
+    };
+
+    let config = AppConfig {
+        server: ServerConfig::default(),
+        storage: StorageConfig {
+            db_path: dir.path().join("seen.db"),
+        },
+        defaults: DefaultsConfig::default(),
+        feeds_dir: None,
+        providers,
+        feeds: vec![feed.clone()],
+    };
+
+    let client = Client::builder().no_proxy().build().unwrap();
+    let store = Store::open(&config.storage.db_path).unwrap();
+
+    // Run 1: sees Article A and marks it seen
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, false)
+            .await
+            .unwrap(),
+        RunOutcome::Published(_)
+    ));
+
+    // Run 2: no new items -> skips without calling LLM
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, false)
+            .await
+            .unwrap(),
+        RunOutcome::Skipped(_)
+    ));
+    assert_eq!(seen_prompts.lock().unwrap().len(), 1);
+
+    // Add Article B; dry-run sees Article B (not A) and does NOT mark B seen
+    rss_items
+        .lock()
+        .unwrap()
+        .push(("guid-b".to_string(), "Article B".to_string()));
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, true)
+            .await
+            .unwrap(),
+        RunOutcome::DryRun { .. }
+    ));
+
+    // Real run still sees Article B (and NOT Article A)
+    assert!(matches!(
+        run_feed(&config, &feed, &client, &store, false)
+            .await
+            .unwrap(),
+        RunOutcome::Published(_)
+    ));
+
+    let prompts = seen_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[0].contains("Article A"));
+    assert!(prompts[2].contains("Article B"));
+    assert!(!prompts[2].contains("Article A"));
 }

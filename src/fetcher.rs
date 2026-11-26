@@ -1,10 +1,13 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use regex::Regex;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 
 use crate::config::SourceConfig;
 use crate::error::{AppError, Result};
+use crate::store::{SeenSourceItem, Store};
 
 const DEFAULT_MAX_CHARS: usize = 12_000;
 const DEFAULT_RSS_LIMIT: usize = 15;
@@ -16,12 +19,26 @@ pub struct FetchedSource {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FetchOutput {
+    pub sources: Vec<FetchedSource>,
+    pub new_rss_items: Vec<SeenSourceItem>,
+    pub tracked_rss_sources: usize,
+}
+
 /// Fetch all configured pre-fetcher sources (`url` and `rss`) for a feed.
 pub async fn fetch_sources(
     client: &Client,
+    feed_id: &str,
     sources: &[SourceConfig],
-) -> Result<Vec<FetchedSource>> {
-    let mut results = Vec::with_capacity(sources.len());
+    store: &Store,
+) -> Result<FetchOutput> {
+    let mut output = FetchOutput {
+        sources: Vec::with_capacity(sources.len()),
+        new_rss_items: Vec::new(),
+        tracked_rss_sources: 0,
+    };
+
     for src in sources {
         match src {
             SourceConfig::Url {
@@ -33,16 +50,43 @@ pub async fn fetch_sources(
                 let content =
                     fetch_url_source(client, url, max_chars.unwrap_or(DEFAULT_MAX_CHARS), headers)
                         .await?;
-                results.push(FetchedSource {
+                output.sources.push(FetchedSource {
                     name: name.clone(),
                     url: url.clone(),
                     content,
                 });
             }
-            SourceConfig::Rss { name, url, limit } => {
-                let content =
-                    fetch_rss_source(client, url, limit.unwrap_or(DEFAULT_RSS_LIMIT)).await?;
-                results.push(FetchedSource {
+            SourceConfig::Rss {
+                name,
+                url,
+                limit,
+                only_new,
+            } => {
+                let seen_keys = if *only_new {
+                    output.tracked_rss_sources += 1;
+                    Some(store.seen_item_keys(feed_id, url)?)
+                } else {
+                    None
+                };
+
+                let (content, new_keys) = fetch_rss_source(
+                    client,
+                    url,
+                    limit.unwrap_or(DEFAULT_RSS_LIMIT),
+                    seen_keys.as_ref(),
+                )
+                .await?;
+
+                if *only_new {
+                    for key in new_keys {
+                        output.new_rss_items.push(SeenSourceItem {
+                            source_url: url.clone(),
+                            item_key: key,
+                        });
+                    }
+                }
+
+                output.sources.push(FetchedSource {
                     name: name.clone(),
                     url: url.clone(),
                     content,
@@ -50,7 +94,8 @@ pub async fn fetch_sources(
             }
         }
     }
-    Ok(results)
+
+    Ok(output)
 }
 
 async fn fetch_url_source(
@@ -100,7 +145,12 @@ async fn fetch_url_source(
     Ok(truncate_chars(&cleaned, max_chars))
 }
 
-async fn fetch_rss_source(client: &Client, url: &str, limit: usize) -> Result<String> {
+async fn fetch_rss_source(
+    client: &Client,
+    url: &str,
+    limit: usize,
+    seen_keys: Option<&HashSet<String>>,
+) -> Result<(String, Vec<String>)> {
     let resp = client
         .get(url)
         .timeout(Duration::from_secs(30))
@@ -124,9 +174,26 @@ async fn fetch_rss_source(client: &Client, url: &str, limit: usize) -> Result<St
         message: e.to_string(),
     })?;
 
-    if let Ok(channel) = rss::Channel::read_from(&bytes[..]) {
+    parse_syndication_bytes(&bytes, url, limit, seen_keys)
+}
+
+fn parse_syndication_bytes(
+    bytes: &[u8],
+    url: &str,
+    limit: usize,
+    seen_keys: Option<&HashSet<String>>,
+) -> Result<(String, Vec<String>)> {
+    if let Ok(channel) = rss::Channel::read_from(bytes) {
         let mut lines = Vec::new();
-        for item in channel.items().iter().take(limit) {
+        let mut new_keys = Vec::new();
+        for item in channel.items() {
+            if lines.len() >= limit {
+                break;
+            }
+            let key = rss_item_key(item);
+            if seen_keys.is_some_and(|seen| seen.contains(&key)) {
+                continue;
+            }
             let title = item.title().unwrap_or("(untitled)").trim();
             let link = item.link().unwrap_or("");
             let date = item.pub_date().unwrap_or("");
@@ -136,13 +203,27 @@ async fn fetch_rss_source(client: &Client, url: &str, limit: usize) -> Result<St
                 .map(|s| truncate_chars(&s, 400))
                 .unwrap_or_default();
             lines.push(format!("- **{title}** ({date}) {link}\n  {summary}"));
+            new_keys.push(key);
         }
-        return Ok(lines.join("\n"));
+        let content = if lines.is_empty() && seen_keys.is_some() {
+            "(No new items since last run.)".to_string()
+        } else {
+            lines.join("\n")
+        };
+        return Ok((content, new_keys));
     }
 
-    if let Ok(feed) = atom_syndication::Feed::read_from(&bytes[..]) {
+    if let Ok(feed) = atom_syndication::Feed::read_from(bytes) {
         let mut lines = Vec::new();
-        for entry in feed.entries().iter().take(limit) {
+        let mut new_keys = Vec::new();
+        for entry in feed.entries() {
+            if lines.len() >= limit {
+                break;
+            }
+            let key = atom_entry_key(entry);
+            if seen_keys.is_some_and(|seen| seen.contains(&key)) {
+                continue;
+            }
             let title = entry.title().as_str().trim();
             let link = entry.links().first().map(|l| l.href()).unwrap_or("");
             let date = entry
@@ -156,14 +237,58 @@ async fn fetch_rss_source(client: &Client, url: &str, limit: usize) -> Result<St
                 .map(|s| truncate_chars(&s, 400))
                 .unwrap_or_default();
             lines.push(format!("- **{title}** ({date}) {link}\n  {summary}"));
+            new_keys.push(key);
         }
-        return Ok(lines.join("\n"));
+        let content = if lines.is_empty() && seen_keys.is_some() {
+            "(No new items since last run.)".to_string()
+        } else {
+            lines.join("\n")
+        };
+        return Ok((content, new_keys));
     }
 
     Err(AppError::Fetch {
         url: url.to_string(),
         message: "response was neither valid RSS 2.0 nor Atom 1.0".to_string(),
     })
+}
+
+fn rss_item_key(item: &rss::Item) -> String {
+    if let Some(guid) = item
+        .guid()
+        .map(|g| g.value().trim())
+        .filter(|s| !s.is_empty())
+    {
+        return guid.to_string();
+    }
+    if let Some(link) = item.link().map(str::trim).filter(|s| !s.is_empty()) {
+        return link.to_string();
+    }
+    fallback_item_hash(item.title().unwrap_or(""), item.pub_date().unwrap_or(""))
+}
+
+fn atom_entry_key(entry: &atom_syndication::Entry) -> String {
+    let id = entry.id().trim();
+    if !id.is_empty() {
+        return id.to_string();
+    }
+    if let Some(href) = entry
+        .links()
+        .first()
+        .map(|l| l.href().trim())
+        .filter(|s| !s.is_empty())
+    {
+        return href.to_string();
+    }
+    fallback_item_hash(entry.title().as_str(), &entry.updated().to_rfc3339())
+}
+
+fn fallback_item_hash(title: &str, date: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(title.trim().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(date.trim().as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 /// Strip scripts/styles/tags and decode common HTML entities into readable plain text.
@@ -212,5 +337,26 @@ mod tests {
     fn truncates_cleanly() {
         assert_eq!(truncate_chars("abcdef", 4), "abcd… [truncated]");
         assert_eq!(truncate_chars("abc", 4), "abc");
+    }
+
+    #[test]
+    fn filters_seen_rss_items_before_applying_limit() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Feed</title><link>https://example.com</link><description>d</description>
+  <item><guid>id-1</guid><title>Old Story</title><link>https://example.com/1</link></item>
+  <item><guid>id-2</guid><title>New Story 1</title><link>https://example.com/2</link></item>
+  <item><guid>id-3</guid><title>New Story 2</title><link>https://example.com/3</link></item>
+</channel></rss>"#;
+
+        let mut seen = HashSet::new();
+        seen.insert("id-1".to_string());
+
+        let (content, new_keys) =
+            parse_syndication_bytes(xml.as_bytes(), "https://example.com/rss", 1, Some(&seen))
+                .unwrap();
+        assert!(!content.contains("Old Story"));
+        assert!(content.contains("New Story 1"));
+        assert!(!content.contains("New Story 2"));
+        assert_eq!(new_keys, vec!["id-2".to_string()]);
     }
 }

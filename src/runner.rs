@@ -13,6 +13,8 @@ use crate::llm::{self, LlmRequest};
 use crate::render::{render_entry_html, render_prompt, PromptContext};
 use crate::store::{FeedEntry, Store};
 
+const MAX_SEEN_ITEMS_PER_SOURCE: usize = 2_000;
+
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
     Published(FeedEntry),
@@ -87,7 +89,19 @@ async fn run_feed_inner(
 
     info!(feed_id = %feed.id, provider = %feed.provider, "running virtual feed");
 
-    let sources = fetch_sources(client, &feed.sources).await?;
+    let fetched = fetch_sources(client, &feed.id, &feed.sources, store).await?;
+
+    if feed.skip_if_no_new_items
+        && fetched.tracked_rss_sources > 0
+        && fetched.new_rss_items.is_empty()
+    {
+        info!(
+            feed_id = %feed.id,
+            "skipping feed run because tracked RSS sources have no new items"
+        );
+        return Ok(RunOutcome::Skipped("no new RSS source items".to_string()));
+    }
+
     let previous_entry = if feed.prompt.contains("{{previous_entry") {
         store.latest_entry(&feed.id)?
     } else {
@@ -97,7 +111,7 @@ async fn run_feed_inner(
         feed,
         &PromptContext {
             now_local,
-            sources: &sources,
+            sources: &fetched.sources,
             previous_entry: previous_entry.as_ref(),
         },
     );
@@ -126,6 +140,13 @@ async fn run_feed_inner(
 
     if let Some(marker) = &feed.skip_if_contains {
         if !marker.is_empty() && llm_resp.text.contains(marker) {
+            if !dry_run {
+                store.mark_source_items_seen(
+                    &feed.id,
+                    &fetched.new_rss_items,
+                    MAX_SEEN_ITEMS_PER_SOURCE,
+                )?;
+            }
             info!(feed_id = %feed.id, marker = %marker, "skipping feed entry due to skip_if_contains match");
             return Ok(RunOutcome::Skipped(format!(
                 "matched skip marker '{marker}'"
@@ -139,6 +160,11 @@ async fn run_feed_inner(
     if !dry_run && feed.deduplicate {
         if let Some(prev_hash) = store.latest_content_hash(&feed.id)? {
             if prev_hash == content_hash {
+                store.mark_source_items_seen(
+                    &feed.id,
+                    &fetched.new_rss_items,
+                    MAX_SEEN_ITEMS_PER_SOURCE,
+                )?;
                 info!(feed_id = %feed.id, "skipping duplicate feed output");
                 return Ok(RunOutcome::Skipped("duplicate content hash".to_string()));
             }
@@ -177,6 +203,7 @@ async fn run_feed_inner(
 
     let max_items = feed.effective_max_items(&config.defaults);
     store.insert_entry(&entry, max_items)?;
+    store.mark_source_items_seen(&feed.id, &fetched.new_rss_items, MAX_SEEN_ITEMS_PER_SOURCE)?;
     info!(feed_id = %feed.id, entry_title = %entry.title, "published feed entry");
 
     Ok(RunOutcome::Published(entry))
