@@ -10,10 +10,10 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, FeedConfig};
 use crate::error::{AppError, Result};
-use crate::fetcher::{fetch_sources, FetchOptions};
 use crate::llm::{self, LlmRequest};
 use crate::reload::ConfigHandle;
 use crate::render::{render_entry_html, render_prompt, PromptContext};
+use crate::sources::{fetch_sources, FetchOptions};
 use crate::store::{FeedEntry, Store};
 
 const MAX_SEEN_ITEMS_PER_SOURCE: usize = 2_000;

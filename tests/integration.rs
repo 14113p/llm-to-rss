@@ -1024,3 +1024,71 @@ async fn dashboard_allows_manual_trigger_without_token_and_guards_concurrency() 
     assert_eq!(body["items"], 1);
     assert!(body["last_run"].as_str().unwrap_or("").starts_with("ok "));
 }
+
+#[tokio::test]
+async fn fetches_multiple_sources_concurrently_in_declared_order() {
+    use llm_to_rss::sources::{fetch_sources, FetchOptions};
+    use std::time::{Duration, Instant};
+
+    let app = Router::new()
+        .route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                "First slow source"
+            }),
+        )
+        .route(
+            "/fast",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                "Second fast source"
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("concurrent.db")).unwrap();
+    let client = Client::builder().no_proxy().build().unwrap();
+    let sources = vec![
+        SourceConfig::Url {
+            name: "First".to_string(),
+            url: format!("http://{addr}/slow"),
+            max_chars: None,
+            headers: BTreeMap::new(),
+        },
+        SourceConfig::Url {
+            name: "Second".to_string(),
+            url: format!("http://{addr}/fast"),
+            max_chars: None,
+            headers: BTreeMap::new(),
+        },
+    ];
+
+    let started = Instant::now();
+    let out = fetch_sources(
+        &client,
+        "order-test",
+        &sources,
+        &store,
+        FetchOptions::default(),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(out.sources.len(), 2);
+    assert_eq!(out.sources[0].name, "First");
+    assert_eq!(out.sources[0].content, "First slow source");
+    assert_eq!(out.sources[1].name, "Second");
+    assert_eq!(out.sources[1].content, "Second fast source");
+    assert!(
+        elapsed < Duration::from_millis(220),
+        "expected concurrent fetch under 220ms, took {elapsed:?}"
+    );
+}

@@ -6,7 +6,7 @@ use pulldown_cmark::{html, Options, Parser};
 
 use crate::config::FeedConfig;
 use crate::error::{AppError, Result};
-use crate::fetcher::{html_to_text, truncate_chars, FetchedSource};
+use crate::sources::{html_to_text, truncate_chars, FetchedSource};
 use crate::store::{Citation, FeedEntry};
 
 const PREVIOUS_ENTRY_MAX_CHARS: usize = 8_000;
